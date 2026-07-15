@@ -27,6 +27,7 @@ import {
 
 export interface CronRuntimeRef {
   requireService(): CronService;
+  assertWritable?(): void;
   getScheduler(): Pick<Scheduler, "runNow" | "getRuntimeStatus"> | undefined;
   getMainExecutor(): Pick<MainExecutor, "applyWakeup"> | undefined;
   runManager(ctx: ExtensionCommandContext): Promise<void>;
@@ -87,6 +88,7 @@ async function dispatchCronIntent(
       await runtime.runManager(ctx);
       return;
     case "guided_add": {
+      runtime.assertWritable?.();
       const draft = await runtime.runWizard(ctx);
       if (!draft) return;
       const created = await service.create(draft);
@@ -94,6 +96,7 @@ async function dispatchCronIntent(
       return;
     }
     case "maintenance": {
+      runtime.assertWritable?.();
       const now = new Date();
       const schedule = intent.interval
         ? resolveSchedule({ kind: "interval", value: intent.interval }, now)
@@ -111,6 +114,7 @@ async function dispatchCronIntent(
       return;
     }
     case "create": {
+      runtime.assertWritable?.();
       const draft = buildJobDraft(pi, ctx, fromCreateInput(intent.input));
       const created = await service.create(draft);
       notify(ctx, `Created ${created.name} (${created.id})`);
@@ -125,16 +129,19 @@ async function dispatchCronIntent(
       return;
     }
     case "pause": {
+      runtime.assertWritable?.();
       const job = await service.pause(intent.selector, "Paused by user");
       notify(ctx, `Paused ${job.name}`);
       return;
     }
     case "resume": {
+      runtime.assertWritable?.();
       const job = await service.resume(intent.selector);
       notify(ctx, `Resumed ${job.name}`);
       return;
     }
     case "run": {
+      runtime.assertWritable?.();
       const job = selectJobFromService(service, intent.selector);
       const scheduler = runtime.getScheduler();
       if (!scheduler)
@@ -144,12 +151,14 @@ async function dispatchCronIntent(
       return;
     }
     case "delete": {
+      runtime.assertWritable?.();
       const job = selectJobFromService(service, intent.selector);
       await service.delete(job.id);
       notify(ctx, `Deleted ${job.name}`);
       return;
     }
     case "edit": {
+      runtime.assertWritable?.();
       const current = selectJobFromService(service, intent.selector);
       const patch = buildJobPatch(
         pi,
@@ -164,6 +173,7 @@ async function dispatchCronIntent(
       return;
     }
     case "stop_all":
+      runtime.assertWritable?.();
       await runtime.stopAll();
       for (const job of service
         .list()

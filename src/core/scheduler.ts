@@ -45,6 +45,7 @@ export class Scheduler {
   private timer: unknown;
   private runningJobId: string | undefined;
   private runningStartedAt: Date | undefined;
+  private activeDrain: Promise<void> | undefined;
   private started = false;
 
   constructor(options: SchedulerOptions) {
@@ -82,7 +83,7 @@ export class Scheduler {
   }
 
   async onAgentSettled(): Promise<void> {
-    await this.drain();
+    void this.requestDrain().catch(this.onError);
   }
 
   async runNow(jobId: string): Promise<void> {
@@ -94,7 +95,11 @@ export class Scheduler {
     if (!this.pending.has(jobId) && this.runningJobId !== jobId) {
       this.pending.set(jobId, this.clock.now());
     }
-    await this.drain();
+    void this.requestDrain().catch(this.onError);
+  }
+
+  async waitForIdle(): Promise<void> {
+    await this.activeDrain;
   }
 
   getRuntimeStatus(jobId: string): RuntimeStatus {
@@ -151,7 +156,18 @@ export class Scheduler {
     // Recompute from wall-clock time. This intentionally skips catch-up and
     // keeps interval schedules anchored rather than drifting from completion.
     this.refresh();
-    await this.drain();
+    await this.requestDrain();
+  }
+
+  private requestDrain(): Promise<void> {
+    if (this.activeDrain) return this.activeDrain;
+    const run = this.drain();
+    this.activeDrain = run;
+    const clear = () => {
+      if (this.activeDrain === run) this.activeDrain = undefined;
+    };
+    void run.then(clear, clear);
+    return run;
   }
 
   private async drain(): Promise<void> {

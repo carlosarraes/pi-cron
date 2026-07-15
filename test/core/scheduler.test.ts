@@ -185,6 +185,7 @@ describe("Scheduler", () => {
 
     dispatcher.idle = true;
     await scheduler.onAgentSettled();
+    await settleAsync();
 
     expect(dispatcher.calls.map((call) => call.jobId)).toEqual([
       "first",

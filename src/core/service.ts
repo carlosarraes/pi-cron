@@ -215,6 +215,25 @@ export class CronService {
     });
   }
 
+  transitionState(
+    selector: string,
+    state: CronJob["state"],
+    reason?: string,
+  ): Promise<CronJob> {
+    return this.enqueueMutation(() => {
+      const before = selectJob(this.jobs.values(), selector);
+      const after: CronJob = {
+        ...before,
+        state,
+        updatedAt: this.clock.now().toISOString(),
+      };
+      if (reason === undefined) delete after.pauseReason;
+      else after.pauseReason = reason;
+      this.persistReplacement(after);
+      return structuredClone(after);
+    });
+  }
+
   list(): CronJob[] {
     return [...this.jobs.values()].map((job) => structuredClone(job));
   }
@@ -278,6 +297,16 @@ export class CronService {
       ) {
         after.state = "paused";
         after.pauseReason = `Paused after ${after.consecutiveFailures} consecutive failures`;
+        after.updatedAt = now;
+        this.persistReplacement(after, () => this.markCheckpointDirty(1));
+      } else if (
+        after.schedule.kind === "once" ||
+        (after.maxRuns !== undefined && after.runCount >= after.maxRuns) ||
+        (after.tokenBudget !== undefined &&
+          after.attributedTokens >= after.tokenBudget)
+      ) {
+        after.state = "completed";
+        delete after.pauseReason;
         after.updatedAt = now;
         this.persistReplacement(after, () => this.markCheckpointDirty(1));
       } else {

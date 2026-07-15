@@ -42,6 +42,7 @@ export function registerCronTools(
     ],
     parameters: CronCreateParams,
     async execute(_id, input, _signal, _update, ctx) {
+      runtime.assertWritable?.();
       const draft = buildJobDraft(pi, ctx, creationFromTool(input));
       const job = await runtime.requireService().create(draft);
       return toolResult(`Created ${job.name} (${job.id})`, job);
@@ -101,6 +102,7 @@ export function registerCronTools(
     ],
     parameters: CronUpdateParams,
     async execute(_id, input, _signal, _update, ctx) {
+      runtime.assertWritable?.();
       const service = runtime.requireService();
       const editable = patchFromTool(input);
       if (input.timezone !== undefined && !hasSchedule(input)) {
@@ -151,6 +153,7 @@ export function registerCronTools(
     ],
     parameters: CronDeleteParams,
     async execute(_id, input) {
+      runtime.assertWritable?.();
       const service = runtime.requireService();
       const job = selectJobFromService(service, input.selector);
       await service.delete(job.id);
@@ -171,6 +174,7 @@ export function registerCronTools(
     ],
     parameters: CronRunParams,
     async execute(_id, input) {
+      runtime.assertWritable?.();
       const service = runtime.requireService();
       const job = selectJobFromService(service, input.selector);
       const scheduler = runtime.getScheduler();
