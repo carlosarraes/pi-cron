@@ -158,6 +158,59 @@ describe("reduceEvents", () => {
       "Malformed pi-cron event",
     );
   });
+
+  it("rejects a created event with an incomplete job", () => {
+    const incomplete = {
+      version: 1,
+      type: "job_created",
+      at: "2026-07-14T12:00:00.000Z",
+      job: { version: 1, id: "incomplete" },
+    } as unknown as CronEvent;
+
+    expect(() => reduceEvents([incomplete])).toThrow("Malformed pi-cron event");
+  });
+
+  it("rejects a checkpoint with an invalid optional metric field", () => {
+    const invalidCheckpoint = {
+      version: 1,
+      type: "metrics_checkpoint",
+      at: "2026-07-15T00:00:00.000Z",
+      jobs: [
+        {
+          id: "job-1",
+          runCount: 1,
+          attributedTokens: 10,
+          consecutiveFailures: 0,
+          lastDispatchAt: 42,
+        },
+      ],
+    } as unknown as CronEvent;
+
+    expect(() => reduceEvents([created(job()), invalidCheckpoint])).toThrow(
+      "Malformed pi-cron event",
+    );
+  });
+
+  it("rejects a checkpoint containing a job configuration key", () => {
+    const invalidCheckpoint = {
+      version: 1,
+      type: "metrics_checkpoint",
+      at: "2026-07-15T00:00:00.000Z",
+      jobs: [
+        {
+          id: "job-1",
+          runCount: 1,
+          attributedTokens: 10,
+          consecutiveFailures: 0,
+          name: "unauthorized replacement",
+        },
+      ],
+    } as unknown as CronEvent;
+
+    expect(() => reduceEvents([created(job()), invalidCheckpoint])).toThrow(
+      "Malformed pi-cron event",
+    );
+  });
 });
 
 describe("PiEventStore", () => {

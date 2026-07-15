@@ -2,6 +2,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { assertCronEvent } from "../domain/reducer.js";
 import type { CronEvent, EventStore } from "../domain/types.js";
 
 const CRON_EVENT_ENTRY = "pi-cron/event";
@@ -20,7 +21,8 @@ export class PiEventStore implements EventStore {
 
     for (const entry of this.sessionManager.getBranch()) {
       if (entry.type === "custom" && entry.customType === CRON_EVENT_ENTRY) {
-        events.push(entry.data as CronEvent);
+        assertCronEvent(entry.data);
+        events.push(entry.data);
       }
     }
 
