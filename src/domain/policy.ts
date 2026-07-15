@@ -1,4 +1,3 @@
-import { nextOccurrence } from "./schedule.js";
 import {
   type CronJob,
   DEFAULT_LIMITS,
@@ -20,13 +19,13 @@ const EFFORT_RANK: Record<
 };
 
 export function selectJob(jobs: Iterable<CronJob>, selector: string): CronJob {
-  const normalized = selector.toLowerCase();
+  const normalized = selector.trim().toLowerCase();
   const candidates = [...jobs];
   const exactId = candidates.find((job) => job.id.toLowerCase() === normalized);
   if (exactId) return exactId;
 
   const exactNames = candidates.filter(
-    (job) => job.name.toLowerCase() === normalized,
+    (job) => job.name.trim().toLowerCase() === normalized,
   );
   if (exactNames.length === 1) return exactNames[0];
   if (exactNames.length > 1) {
@@ -36,7 +35,7 @@ export function selectJob(jobs: Iterable<CronJob>, selector: string): CronJob {
   const prefixes = candidates.filter(
     (job) =>
       job.id.toLowerCase().startsWith(normalized) ||
-      job.name.toLowerCase().startsWith(normalized),
+      job.name.trim().toLowerCase().startsWith(normalized),
   );
   if (prefixes.length === 1) return prefixes[0];
   if (prefixes.length > 1) {
@@ -65,8 +64,8 @@ export function validateJob(
 export function requiresReapproval(before: CronJob, after: CronJob): boolean {
   return (
     promptFingerprint(before.prompt) !== promptFingerprint(after.prompt) ||
-    cadenceMs(after.schedule) < cadenceMs(before.schedule) ||
-    Date.parse(after.expiresAt) > Date.parse(before.expiresAt) ||
+    scheduleRaisesPrivilege(before.schedule, after.schedule) ||
+    expiryRaisesPrivilege(before.expiresAt, after.expiresAt) ||
     raisesExecutionPrivilege(before.execution, after.execution) ||
     raisesLimit(before.maxRuns, after.maxRuns) ||
     raisesLimit(before.tokenBudget, after.tokenBudget)
@@ -89,21 +88,40 @@ function promptFingerprint(prompt: CronJob["prompt"]): string {
   }
 }
 
-function cadenceMs(schedule: Schedule): number {
-  const first = nextOccurrence(schedule, new Date("2000-01-01T00:00:00.000Z"));
-  if (!first) return Number.POSITIVE_INFINITY;
+function scheduleRaisesPrivilege(before: Schedule, after: Schedule): boolean {
+  if (before.kind !== after.kind) return true;
 
-  let latest = first;
-  let occurrenceCount = 1;
-  while (occurrenceCount < 32) {
-    const next = nextOccurrence(schedule, latest);
-    if (!next) break;
-    latest = next;
-    occurrenceCount += 1;
+  switch (before.kind) {
+    case "interval":
+      return after.kind === "interval" && after.intervalMs < before.intervalMs;
+    case "cron":
+      return (
+        after.kind === "cron" &&
+        (after.expression !== before.expression ||
+          after.timezone !== before.timezone)
+      );
+    case "once":
+      return after.kind === "once" && after.at !== before.at;
+    case "adaptive":
+      return (
+        after.kind === "adaptive" && after.nextWakeAt !== before.nextWakeAt
+      );
+    case "maintenance": {
+      if (after.kind !== "maintenance") return true;
+      if (before.cadence === "adaptive" || after.cadence === "adaptive") {
+        return before.cadence !== after.cadence;
+      }
+      return after.cadence.intervalMs < before.cadence.intervalMs;
+    }
   }
-  return occurrenceCount > 1
-    ? (latest.getTime() - first.getTime()) / (occurrenceCount - 1)
-    : Number.POSITIVE_INFINITY;
+}
+
+function expiryRaisesPrivilege(before: string, after: string): boolean {
+  if (before === after) return false;
+  const beforeMs = Date.parse(before);
+  const afterMs = Date.parse(after);
+  if (!Number.isFinite(beforeMs) || !Number.isFinite(afterMs)) return true;
+  return afterMs > beforeMs;
 }
 
 function raisesExecutionPrivilege(

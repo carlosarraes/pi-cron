@@ -4,6 +4,7 @@ import {
   validateJob,
 } from "../domain/policy.js";
 import { assertCronEvent, reduceEvents } from "../domain/reducer.js";
+import { nextOccurrence } from "../domain/schedule.js";
 import {
   type ApprovalPort,
   type Clock,
@@ -15,7 +16,10 @@ import {
   type ExecutionMode,
   type ProposedJob,
   type Schedule,
+  type TechnicalOutcome,
 } from "../domain/types.js";
+
+const MAX_ID_ATTEMPTS = 16;
 
 export interface JobDraft {
   name?: string;
@@ -25,11 +29,19 @@ export interface JobDraft {
   expiresAt?: string;
   maxRuns?: number;
   tokenBudget?: number;
+  unsafeSeconds?: boolean;
 }
 
 export type JobPatch = Partial<JobDraft>;
 
 export interface ActiveExecution {
+  readonly token: string;
+  readonly jobId: string;
+  readonly adaptive: boolean;
+  readonly decisionMade: boolean;
+}
+
+interface MutableActiveExecution {
   token: string;
   jobId: string;
   adaptive: boolean;
@@ -44,6 +56,7 @@ export interface CronServiceOptions {
   sessionId: string;
   idFactory: () => string;
   onChanged?: () => void;
+  onObserverError?: (error: unknown) => void;
 }
 
 export interface CheckpointPolicy {
@@ -59,9 +72,11 @@ type JobMetrics = Extract<
 export class CronService {
   private readonly events: CronEvent[];
   private jobs: Map<string, CronJob>;
-  private activeExecution: ActiveExecution | undefined;
+  private activeExecution: MutableActiveExecution | undefined;
   private dirtyRunCount = 0;
   private dirtySinceMs: number | undefined;
+  private mutationTail: Promise<void> = Promise.resolve();
+  private pendingMutationCount = 0;
 
   private readonly store: EventStore;
   private readonly approvals: ApprovalPort;
@@ -69,6 +84,7 @@ export class CronService {
   private readonly sessionId: string;
   private readonly idFactory: () => string;
   private readonly onChanged: (() => void) | undefined;
+  private readonly onObserverError: ((error: unknown) => void) | undefined;
 
   constructor(options: CronServiceOptions) {
     this.events = structuredClone(options.events);
@@ -79,90 +95,116 @@ export class CronService {
     this.sessionId = options.sessionId;
     this.idFactory = options.idFactory;
     this.onChanged = options.onChanged;
+    this.onObserverError = options.onObserverError;
   }
 
-  async create(draft: JobDraft): Promise<CronJob> {
+  create(draft: JobDraft): Promise<CronJob> {
     if (this.activeExecution) {
-      throw new Error("Scheduled runs cannot create cron jobs");
+      return Promise.reject(
+        new Error("Scheduled runs cannot create cron jobs"),
+      );
     }
+    return this.enqueueMutation(async () => {
+      if (this.activeExecution) {
+        throw new Error("Scheduled runs cannot create cron jobs");
+      }
+      const now = this.clock.now();
+      const id = this.generateUniqueId();
+      const proposed = buildProposedJob(draft, now, this.sessionId, id);
+      this.validateCandidate(proposed, draft.unsafeSeconds === true, now);
 
-    const now = this.clock.now();
-    const id = this.idFactory();
-    const proposed = buildProposedJob(draft, now, this.sessionId, id);
-    validateJob(proposed, this.jobs.values());
-
-    const approval = await this.approvals.approve(
-      structuredClone(proposed),
-      "create",
-    );
-    if (!approval) throw new Error("Cron job creation cancelled");
-
-    const approved: CronJob = {
-      ...proposed,
-      approval: structuredClone(approval),
-    };
-    this.persistAndApply({
-      version: 1,
-      type: "job_created",
-      at: this.clock.now().toISOString(),
-      job: approved,
-    });
-    return structuredClone(approved);
-  }
-
-  async replace(selector: string, patch: JobPatch): Promise<CronJob> {
-    const before = selectJob(this.jobs.values(), selector);
-    const after = applyPatch(before, patch, this.clock.now());
-    const proposed = withoutApproval(after);
-    validateJob(proposed, this.jobs.values());
-
-    if (requiresReapproval(before, after)) {
       const approval = await this.approvals.approve(
         structuredClone(proposed),
-        "privilege_increase",
+        "create",
       );
-      if (!approval) throw new Error("Cron job replacement cancelled");
-      after.approval = structuredClone(approval);
-    }
+      if (!approval) throw new Error("Cron job creation cancelled");
+      this.validateCandidate(
+        proposed,
+        draft.unsafeSeconds === true,
+        this.clock.now(),
+      );
 
-    this.persistReplacement(after);
-    return structuredClone(after);
+      const approved: CronJob = {
+        ...proposed,
+        approval: structuredClone(approval),
+      };
+      this.persistAndApply({
+        version: 1,
+        type: "job_created",
+        at: this.clock.now().toISOString(),
+        job: approved,
+      });
+      return structuredClone(approved);
+    });
   }
 
-  pause(selector: string, reason?: string): CronJob {
-    const before = selectJob(this.jobs.values(), selector);
-    const after: CronJob = {
-      ...before,
-      state: "paused",
-      updatedAt: this.clock.now().toISOString(),
-    };
-    if (reason === undefined) delete after.pauseReason;
-    else after.pauseReason = reason;
+  replace(selector: string, patch: JobPatch): Promise<CronJob> {
+    return this.enqueueMutation(async () => {
+      const before = selectJob(this.jobs.values(), selector);
+      const now = this.clock.now();
+      const after = applyPatch(before, patch, now);
+      const proposed = withoutApproval(after);
+      this.validateCandidate(proposed, patch.unsafeSeconds === true, now);
 
-    this.persistReplacement(after);
-    return structuredClone(after);
+      if (requiresReapproval(before, after)) {
+        const approval = await this.approvals.approve(
+          structuredClone(proposed),
+          "privilege_increase",
+        );
+        if (!approval) throw new Error("Cron job replacement cancelled");
+        this.validateCandidate(
+          proposed,
+          patch.unsafeSeconds === true,
+          this.clock.now(),
+        );
+        after.approval = structuredClone(approval);
+      }
+
+      this.persistReplacement(after);
+      return structuredClone(after);
+    });
   }
 
-  resume(selector: string): CronJob {
-    const before = selectJob(this.jobs.values(), selector);
-    const after: CronJob = {
-      ...before,
-      state: "active",
-      updatedAt: this.clock.now().toISOString(),
-    };
-    delete after.pauseReason;
+  pause(selector: string, reason?: string): Promise<CronJob> {
+    return this.enqueueMutation(() => {
+      const before = selectJob(this.jobs.values(), selector);
+      const after: CronJob = {
+        ...before,
+        state: "paused",
+        updatedAt: this.clock.now().toISOString(),
+      };
+      if (reason === undefined) delete after.pauseReason;
+      else after.pauseReason = reason;
 
-    this.persistReplacement(after);
-    return structuredClone(after);
+      this.persistReplacement(after);
+      return structuredClone(after);
+    });
   }
 
-  delete(selector: string): void {
-    const job = selectJob(this.jobs.values(), selector);
-    this.persistAndApply({
-      version: 1,
-      type: "job_deleted",
-      at: this.clock.now().toISOString(),
-      jobId: job.id,
+  resume(selector: string): Promise<CronJob> {
+    return this.enqueueMutation(() => {
+      const before = selectJob(this.jobs.values(), selector);
+      const after: CronJob = {
+        ...before,
+        state: "active",
+        updatedAt: this.clock.now().toISOString(),
+      };
+      delete after.pauseReason;
+
+      this.persistReplacement(after);
+      return structuredClone(after);
+    });
+  }
+
+  delete(selector: string): Promise<void> {
+    return this.enqueueMutation(() => {
+      const job = selectJob(this.jobs.values(), selector);
+      this.persistAndApply({
+        version: 1,
+        type: "job_deleted",
+        at: this.clock.now().toISOString(),
+        jobId: job.id,
+      });
     });
   }
 
@@ -175,36 +217,61 @@ export class CronService {
     return job === undefined ? undefined : structuredClone(job);
   }
 
-  recordRun(jobId: string, result: DispatchResult, scheduledAt: Date): void {
-    const before = this.requireJob(jobId);
-    const after: CronJob = {
-      ...before,
-      runCount: before.runCount + 1,
-      attributedTokens: before.attributedTokens + result.tokens,
-      consecutiveFailures: nextFailureCount(
-        before.consecutiveFailures,
-        result.outcome,
-      ),
-      lastOccurrenceAt: scheduledAt.toISOString(),
-      lastTechnicalOutcome: result.outcome,
-    };
-    const now = this.clock.now().toISOString();
-    if (result.outcome === "dispatched") after.lastDispatchAt = now;
-    if (result.outcome === "settled") after.lastSettledAt = now;
+  recordRun(
+    jobId: string,
+    result: DispatchResult,
+    scheduledAt: Date,
+  ): Promise<void> {
+    return this.enqueueMutation(() => {
+      validateRunInput(result, scheduledAt);
+      const before = this.requireJob(jobId);
+      const scheduledAtIso = scheduledAt.toISOString();
+      const now = this.clock.now().toISOString();
 
-    if (
-      after.consecutiveFailures >= DEFAULT_LIMITS.maxConsecutiveFailures &&
-      after.state !== "paused"
-    ) {
-      after.state = "paused";
-      after.pauseReason = `Paused after ${after.consecutiveFailures} consecutive failures`;
-      after.updatedAt = now;
-      this.persistReplacement(after);
-    } else {
-      this.jobs.set(jobId, after);
-      this.onChanged?.();
-    }
-    this.markCheckpointDirty();
+      if (result.outcome === "dispatched") {
+        const dispatched: CronJob = {
+          ...before,
+          lastOccurrenceAt: scheduledAtIso,
+          lastDispatchAt: now,
+          lastTechnicalOutcome: "dispatched",
+        };
+        this.jobs.set(jobId, dispatched);
+        this.markCheckpointDirty(0);
+        this.notifyChanged();
+        return;
+      }
+
+      const after: CronJob = {
+        ...before,
+        runCount: before.runCount + 1,
+        attributedTokens: before.attributedTokens + result.tokens,
+        consecutiveFailures: nextFailureCount(
+          before.consecutiveFailures,
+          result.outcome,
+        ),
+        lastOccurrenceAt: scheduledAtIso,
+        lastTechnicalOutcome: result.outcome,
+      };
+      const hasDispatchForOccurrence =
+        before.lastOccurrenceAt === scheduledAtIso &&
+        before.lastDispatchAt !== undefined;
+      if (!hasDispatchForOccurrence) after.lastDispatchAt = now;
+      if (result.outcome === "settled") after.lastSettledAt = now;
+
+      if (
+        after.consecutiveFailures >= DEFAULT_LIMITS.maxConsecutiveFailures &&
+        after.state !== "paused"
+      ) {
+        after.state = "paused";
+        after.pauseReason = `Paused after ${after.consecutiveFailures} consecutive failures`;
+        after.updatedAt = now;
+        this.persistReplacement(after, () => this.markCheckpointDirty(1));
+      } else {
+        this.jobs.set(jobId, after);
+        this.markCheckpointDirty(1);
+        this.notifyChanged();
+      }
+    });
   }
 
   shouldFlushCheckpoint(policy: CheckpointPolicy): boolean {
@@ -215,99 +282,163 @@ export class CronService {
     );
   }
 
-  flushCheckpoint(): void {
-    if (this.dirtySinceMs === undefined) return;
+  flushCheckpoint(): Promise<void> {
+    return this.enqueueMutation(() => {
+      if (this.dirtySinceMs === undefined) return;
 
-    const event: CronEvent = {
-      version: 1,
-      type: "metrics_checkpoint",
-      at: this.clock.now().toISOString(),
-      jobs: [...this.jobs.values()].map(toMetrics),
-    };
-    this.persistAndApply(event);
-    this.dirtyRunCount = 0;
-    this.dirtySinceMs = undefined;
+      const event: CronEvent = {
+        version: 1,
+        type: "metrics_checkpoint",
+        at: this.clock.now().toISOString(),
+        jobs: [...this.jobs.values()].map(toMetrics),
+      };
+      this.persistAndApply(event, () => {
+        this.dirtyRunCount = 0;
+        this.dirtySinceMs = undefined;
+      });
+    });
   }
 
-  beginExecution(jobId: string, adaptive: boolean): ActiveExecution {
+  beginExecution(jobId: string, adaptive: boolean): string {
+    if (this.pendingMutationCount > 0) {
+      throw new Error(
+        "Cannot begin execution while a durable mutation is pending",
+      );
+    }
     this.requireJob(jobId);
     if (this.activeExecution) {
       throw new Error("A cron execution is already active");
     }
-    const execution: ActiveExecution = {
-      token: crypto.randomUUID(),
+    const token = crypto.randomUUID();
+    this.activeExecution = {
+      token,
       jobId,
       adaptive,
       decisionMade: false,
     };
-    this.activeExecution = execution;
-    return execution;
+    return token;
   }
 
   getActiveExecution(): ActiveExecution | undefined {
-    return this.activeExecution;
+    return this.activeExecution === undefined
+      ? undefined
+      : Object.freeze({ ...this.activeExecution });
   }
 
   endExecution(token: string): void {
+    this.requireActiveToken(token);
+    this.activeExecution = undefined;
+  }
+
+  setAdaptiveWakeup(token: string, at: Date, reason: string): Promise<void> {
+    return this.enqueueMutation(() => {
+      const execution = this.requireAdaptiveToken(token);
+      const before = this.requireJob(execution.jobId);
+      if (before.schedule.kind !== "adaptive") {
+        throw new Error(`Cron job '${execution.jobId}' is not adaptive`);
+      }
+      const after: CronJob = {
+        ...before,
+        schedule: {
+          kind: "adaptive",
+          nextWakeAt: at.toISOString(),
+          fallbackUsed: false,
+        },
+        state: "active",
+        updatedAt: this.clock.now().toISOString(),
+      };
+      delete after.pauseReason;
+      validateAdaptiveWakeup(at.toISOString(), this.clock.now());
+      void reason;
+
+      this.persistReplacement(after, () => {
+        execution.decisionMade = true;
+      });
+    });
+  }
+
+  stopAdaptive(token: string, reason: string): Promise<void> {
+    return this.enqueueMutation(() => {
+      const execution = this.requireAdaptiveToken(token);
+      const before = this.requireJob(execution.jobId);
+      if (before.schedule.kind !== "adaptive") {
+        throw new Error(`Cron job '${execution.jobId}' is not adaptive`);
+      }
+      const after: CronJob = {
+        ...before,
+        state: "paused",
+        pauseReason: reason,
+        updatedAt: this.clock.now().toISOString(),
+      };
+
+      this.persistReplacement(after, () => {
+        execution.decisionMade = true;
+      });
+    });
+  }
+
+  private enqueueMutation<T>(operation: () => Promise<T> | T): Promise<T> {
+    this.pendingMutationCount += 1;
+    const run = this.mutationTail.then(operation);
+    this.mutationTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run.then(
+      (value) => {
+        this.pendingMutationCount -= 1;
+        return value;
+      },
+      (error: unknown) => {
+        this.pendingMutationCount -= 1;
+        throw error;
+      },
+    );
+  }
+
+  private generateUniqueId(): string {
+    const existingIds = new Set(
+      [...this.jobs.keys()].map((id) => id.trim().toLowerCase()),
+    );
+    for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt += 1) {
+      const id = this.idFactory().trim().toLowerCase();
+      if (id.length > 0 && !existingIds.has(id)) return id;
+    }
+    throw new Error(
+      `Unable to generate a unique cron job ID after ${MAX_ID_ATTEMPTS} attempts`,
+    );
+  }
+
+  private validateCandidate(
+    candidate: ProposedJob,
+    unsafeSeconds: boolean,
+    now: Date,
+  ): void {
+    validateJob(candidate, this.jobs.values());
+    validateExpiry(candidate.expiresAt, now);
+    validatePositiveLimit("maxRuns", candidate.maxRuns);
+    validatePositiveLimit("tokenBudget", candidate.tokenBudget);
+    if (candidate.execution.kind === "isolated") {
+      validatePositiveInteger("timeout", candidate.execution.timeoutMs);
+    }
+    validateSchedule(candidate.schedule, now, unsafeSeconds, candidate.maxRuns);
+  }
+
+  private requireActiveToken(token: string): MutableActiveExecution {
     if (!this.activeExecution || this.activeExecution.token !== token) {
       throw new Error(
         "Cron execution token does not match the active execution",
       );
     }
-    this.activeExecution = undefined;
-  }
-
-  setAdaptiveWakeup(jobId: string, at: Date, reason: string): void {
-    const execution = this.requireAdaptiveExecution(jobId);
-    const before = this.requireJob(jobId);
-    if (before.schedule.kind !== "adaptive") {
-      throw new Error(`Cron job '${jobId}' is not adaptive`);
-    }
-    const after: CronJob = {
-      ...before,
-      schedule: {
-        kind: "adaptive",
-        nextWakeAt: at.toISOString(),
-        fallbackUsed: false,
-      },
-      state: "active",
-      updatedAt: this.clock.now().toISOString(),
-    };
-    delete after.pauseReason;
-    void reason;
-
-    this.persistReplacement(after);
-    execution.decisionMade = true;
-  }
-
-  stopAdaptive(jobId: string, reason: string): void {
-    const execution = this.requireAdaptiveExecution(jobId);
-    const before = this.requireJob(jobId);
-    if (before.schedule.kind !== "adaptive") {
-      throw new Error(`Cron job '${jobId}' is not adaptive`);
-    }
-    const after: CronJob = {
-      ...before,
-      state: "paused",
-      pauseReason: reason,
-      updatedAt: this.clock.now().toISOString(),
-    };
-
-    this.persistReplacement(after);
-    execution.decisionMade = true;
-  }
-
-  private requireAdaptiveExecution(jobId: string): ActiveExecution {
-    if (
-      !this.activeExecution ||
-      this.activeExecution.jobId !== jobId ||
-      !this.activeExecution.adaptive
-    ) {
-      throw new Error(
-        `No adaptive execution is active for cron job '${jobId}'`,
-      );
-    }
     return this.activeExecution;
+  }
+
+  private requireAdaptiveToken(token: string): MutableActiveExecution {
+    const execution = this.requireActiveToken(token);
+    if (!execution.adaptive) {
+      throw new Error("The active cron execution is not adaptive");
+    }
+    return execution;
   }
 
   private requireJob(jobId: string): CronJob {
@@ -316,23 +447,26 @@ export class CronService {
     return job;
   }
 
-  private markCheckpointDirty(): void {
-    this.dirtyRunCount += 1;
+  private markCheckpointDirty(finalRunIncrement: number): void {
+    this.dirtyRunCount += finalRunIncrement;
     this.dirtySinceMs ??= this.clock.now().getTime();
   }
 
-  private persistReplacement(job: CronJob): void {
-    this.persistAndApply({
-      version: 1,
-      type: "job_replaced",
-      at: this.clock.now().toISOString(),
-      job,
-    });
+  private persistReplacement(job: CronJob, beforeNotify?: () => void): void {
+    this.persistAndApply(
+      {
+        version: 1,
+        type: "job_replaced",
+        at: this.clock.now().toISOString(),
+        job,
+      },
+      beforeNotify,
+    );
   }
 
-  private persistAndApply(event: CronEvent): void {
+  private persistAndApply(event: CronEvent, beforeNotify?: () => void): void {
     assertCronEvent(event);
-    this.store.append(event);
+    this.store.append(structuredClone(event));
     const reduced = reduceEvents([...this.events, event]);
     if (
       this.dirtySinceMs !== undefined &&
@@ -351,7 +485,20 @@ export class CronService {
     }
     this.jobs = reduced;
     this.events.push(structuredClone(event));
-    this.onChanged?.();
+    beforeNotify?.();
+    this.notifyChanged();
+  }
+
+  private notifyChanged(): void {
+    try {
+      this.onChanged?.();
+    } catch (error) {
+      try {
+        this.onObserverError?.(error);
+      } catch {
+        // Observer error reporting is deliberately isolated from service state.
+      }
+    }
   }
 }
 
@@ -365,7 +512,7 @@ function buildProposedJob(
   const proposed: ProposedJob = {
     version: 1,
     id,
-    name: draft.name ?? `job-${id}`,
+    name: (draft.name ?? `job-${id}`).trim(),
     prompt: structuredClone(draft.prompt),
     schedule: structuredClone(draft.schedule),
     state: "active",
@@ -388,7 +535,7 @@ function buildProposedJob(
 function applyPatch(before: CronJob, patch: JobPatch, now: Date): CronJob {
   const after: CronJob = {
     ...before,
-    name: patch.name ?? before.name,
+    name: (patch.name ?? before.name).trim(),
     prompt: structuredClone(patch.prompt ?? before.prompt),
     schedule: structuredClone(patch.schedule ?? before.schedule),
     execution: structuredClone(patch.execution ?? before.execution),
@@ -416,13 +563,116 @@ function withoutApproval(job: CronJob): ProposedJob {
   return proposed;
 }
 
+function validateExpiry(expiresAt: string, now: Date): void {
+  const timestamp = Date.parse(expiresAt);
+  if (!Number.isFinite(timestamp)) throw new Error("Invalid cron job expiry");
+  if (timestamp <= now.getTime()) {
+    throw new Error("Cron job expiry must be in the future");
+  }
+}
+
+function validateSchedule(
+  schedule: Schedule,
+  now: Date,
+  unsafeSeconds: boolean,
+  maxRuns: number | undefined,
+): void {
+  switch (schedule.kind) {
+    case "interval":
+      validateRecurringInterval(
+        schedule.intervalMs,
+        schedule.anchorAt,
+        unsafeSeconds,
+        maxRuns,
+      );
+      return;
+    case "cron":
+      nextOccurrence(schedule, now);
+      return;
+    case "once":
+      validateFutureTimestamp("One-shot schedule", schedule.at, now);
+      return;
+    case "adaptive":
+      validateAdaptiveWakeup(schedule.nextWakeAt, now);
+      return;
+    case "maintenance":
+      if (schedule.cadence === "adaptive") return;
+      validateRecurringInterval(
+        schedule.cadence.intervalMs,
+        schedule.cadence.anchorAt,
+        unsafeSeconds,
+        maxRuns,
+      );
+      return;
+    default:
+      throw new Error("Invalid cron schedule");
+  }
+}
+
+function validateRecurringInterval(
+  intervalMs: number,
+  anchorAt: string,
+  unsafeSeconds: boolean,
+  maxRuns: number | undefined,
+): void {
+  validatePositiveInteger("interval", intervalMs);
+  validateTimestamp("interval anchor", anchorAt);
+  if (intervalMs < DEFAULT_LIMITS.minRecurringMs) {
+    if (!unsafeSeconds) {
+      throw new Error("Sub-minute intervals require unsafeSeconds");
+    }
+    if (maxRuns === undefined) {
+      throw new Error("Sub-minute intervals require maxRuns");
+    }
+  }
+}
+
+function validateAdaptiveWakeup(value: string, now: Date): void {
+  validateFutureTimestamp("Adaptive wakeup", value, now);
+}
+
+function validateFutureTimestamp(
+  label: string,
+  value: string,
+  now: Date,
+): void {
+  const timestamp = validateTimestamp(label, value);
+  if (timestamp <= now.getTime())
+    throw new Error(`${label} must be in the future`);
+}
+
+function validateTimestamp(label: string, value: string): number {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp))
+    throw new Error(`Invalid ${label} timestamp`);
+  return timestamp;
+}
+
+function validatePositiveLimit(label: string, value: number | undefined): void {
+  if (value !== undefined) validatePositiveInteger(label, value);
+}
+
+function validatePositiveInteger(label: string, value: number): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive safe integer`);
+  }
+}
+
+function validateRunInput(result: DispatchResult, scheduledAt: Date): void {
+  if (!Number.isFinite(scheduledAt.getTime())) {
+    throw new Error("Run schedule timestamp is invalid");
+  }
+  if (!Number.isFinite(result.tokens) || result.tokens < 0) {
+    throw new Error("Run token count must be a non-negative finite number");
+  }
+}
+
 function nextFailureCount(
   current: number,
-  outcome: DispatchResult["outcome"],
+  outcome: Exclude<TechnicalOutcome, "dispatched">,
 ): number {
   if (outcome === "settled") return 0;
-  if (["failed", "timed_out", "aborted"].includes(outcome)) return current + 1;
-  return current;
+  return current + 1;
 }
 
 function withMetrics(job: CronJob, metrics: CronJob): CronJob {

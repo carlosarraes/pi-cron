@@ -57,11 +57,17 @@ describe("selectJob", () => {
     job({ id: "ffff0000", name: "Weekly report" }),
   ];
 
-  it("selects exact IDs and names before unambiguous prefixes", () => {
-    expect(selectJob(jobs, "ABCD1234").id).toBe("abcd1234");
-    expect(selectJob(jobs, "daily REPORT").id).toBe("abcd1234");
-    expect(selectJob(jobs, "ffff").id).toBe("ffff0000");
-    expect(selectJob(jobs, "weekly").id).toBe("ffff0000");
+  it("selects trimmed exact IDs and names before unambiguous prefixes", () => {
+    expect(selectJob(jobs, " ABCD1234 ").id).toBe("abcd1234");
+    expect(selectJob(jobs, " daily REPORT ").id).toBe("abcd1234");
+    expect(selectJob(jobs, " ffff ").id).toBe("ffff0000");
+    expect(selectJob(jobs, " weekly ").id).toBe("ffff0000");
+  });
+
+  it("normalizes names already stored with surrounding whitespace", () => {
+    expect(selectJob([job({ name: "  Padded  " })], " padded ").id).toBe(
+      "abcd1234",
+    );
   });
 
   it("prefers an exact ID over another job's matching name", () => {
@@ -112,15 +118,62 @@ describe("requiresReapproval", () => {
     expect(requiresReapproval(before, after)).toBe(true);
   });
 
-  it("detects a faster cron cadence", () => {
+  it.each([
+    ["faster cron", { kind: "cron", expression: "0 9 * * *", timezone: "UTC" }],
+    ["slower cron", { kind: "cron", expression: "0 9 * * 1", timezone: "UTC" }],
+    [
+      "timezone-only cron edit",
+      { kind: "cron", expression: "0 9 * * 1-5", timezone: "Europe/London" },
+    ],
+    [
+      "schedule-kind transition",
+      {
+        kind: "interval",
+        intervalMs: 86_400_000,
+        anchorAt: "2026-07-14T12:00:00.000Z",
+      },
+    ],
+  ] as const)("fails closed for %s", (_label, schedule) => {
     const before = job({
-      schedule: { kind: "cron", expression: "0 9 * * 1", timezone: "UTC" },
+      schedule: { kind: "cron", expression: "0 9 * * 1-5", timezone: "UTC" },
     });
-    const after = job({
-      schedule: { kind: "cron", expression: "0 9 * * *", timezone: "UTC" },
-    });
+    expect(requiresReapproval(before, job({ schedule }))).toBe(true);
+  });
 
-    expect(requiresReapproval(before, after)).toBe(true);
+  it("does not reapprove an identical cron definition", () => {
+    const schedule = {
+      kind: "cron",
+      expression: "0 9 * * 1-5",
+      timezone: "UTC",
+    } as const;
+    expect(
+      requiresReapproval(job({ schedule }), job({ schedule: { ...schedule } })),
+    ).toBe(false);
+  });
+
+  it.each([
+    [
+      "one-shot timing",
+      { kind: "once", at: "2026-07-15T13:00:00.000Z", original: "tomorrow" },
+      { kind: "once", at: "2026-07-15T14:00:00.000Z", original: "tomorrow" },
+    ],
+    [
+      "adaptive timing",
+      {
+        kind: "adaptive",
+        nextWakeAt: "2026-07-15T13:00:00.000Z",
+        fallbackUsed: false,
+      },
+      {
+        kind: "adaptive",
+        nextWakeAt: "2026-07-15T14:00:00.000Z",
+        fallbackUsed: false,
+      },
+    ],
+  ] as const)("reapproves %s changes", (_label, before, after) => {
+    expect(
+      requiresReapproval(job({ schedule: before }), job({ schedule: after })),
+    ).toBe(true);
   });
 
   it.each([
@@ -138,11 +191,18 @@ describe("requiresReapproval", () => {
     ["longer expiry", { expiresAt: "2026-07-22T12:00:00.000Z" }],
     ["larger max-runs cap", { maxRuns: 11 }],
     ["larger token cap", { tokenBudget: 1_001 }],
+    ["removed max-runs cap", { maxRuns: undefined }],
+    ["removed token cap", { tokenBudget: undefined }],
     ["main-mode escalation", { execution: { kind: "main" } }],
     ["notify enablement", { execution: { ...job().execution, notify: true } }],
     [
-      "added resources",
+      "added tools",
       { execution: { ...job().execution, tools: ["read", "bash"] } },
+    ],
+    ["added skills", { execution: { ...job().execution, skills: ["review"] } }],
+    [
+      "added extensions",
+      { execution: { ...job().execution, extensions: ["ext"] } },
     ],
     ["model change", { execution: { ...job().execution, model: "model-b" } }],
     ["effort increase", { execution: { ...job().execution, effort: "high" } }],
@@ -189,5 +249,19 @@ describe("requiresReapproval", () => {
     expect(requiresReapproval(before, job(change as Partial<CronJob>))).toBe(
       false,
     );
+  });
+
+  it("allows main-to-isolated and notify disablement without approval", () => {
+    expect(
+      requiresReapproval(job({ execution: { kind: "main" } }), job()),
+    ).toBe(false);
+    const isolated = job().execution as Extract<
+      CronJob["execution"],
+      { kind: "isolated" }
+    >;
+    const notifying = job({
+      execution: { ...isolated, notify: true },
+    });
+    expect(requiresReapproval(notifying, job())).toBe(false);
   });
 });
