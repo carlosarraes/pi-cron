@@ -344,7 +344,12 @@ export class CronService {
     this.activeExecution = undefined;
   }
 
-  setAdaptiveWakeup(token: string, at: Date, reason: string): Promise<void> {
+  setAdaptiveWakeup(
+    token: string,
+    at: Date,
+    reason: string,
+    fallbackUsed = false,
+  ): Promise<void> {
     return this.enqueueMutation(() => {
       const execution = this.requireAdaptiveToken(token);
       const before = this.requireJob(execution.jobId);
@@ -356,7 +361,7 @@ export class CronService {
         schedule: {
           kind: "adaptive",
           nextWakeAt: at.toISOString(),
-          fallbackUsed: false,
+          fallbackUsed,
         },
         state: "active",
         updatedAt: this.clock.now().toISOString(),
