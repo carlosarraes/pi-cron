@@ -189,6 +189,10 @@ describe("parseCronCommand", () => {
     ["add --adaptive --prompt work --tools read", /requires --isolated/],
     ["add --every 30s --unsafe-seconds --prompt work", /requires --max-runs/],
     ["add --every 30s --max-runs 5 --prompt work", /at least 1m/],
+    [
+      `add --every 30s --unsafe-seconds --max-runs ${"9".repeat(400)} --prompt work`,
+      /positive integer/,
+    ],
     ["add --adaptive --prompt work --unknown value", /Unknown flag/],
     ["add --adaptive --prompt one --prompt two", /Duplicate flag/],
     ["add --adaptive --prompt", /requires a value/],
@@ -196,9 +200,11 @@ describe("parseCronCommand", () => {
     ["list extra", /Usage/],
     ["show", /Usage/],
     ["show one two", /Usage/],
+    ['show ""', /Usage/],
     ["stop", /Usage/],
     ["stop job-1", /Usage/],
     ["edit job-1", /at least one field/],
+    ['edit "" --prompt work', /Usage/],
   ])("rejects malformed input: %s", (raw, message) => {
     expect(() => parseCronCommand(raw)).toThrowError(message);
   });

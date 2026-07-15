@@ -259,7 +259,7 @@ function parseStrictAdd(tokens: string[]): CommandIntent {
 }
 
 function parseEdit(tokens: string[]): CommandIntent {
-  if (tokens.length === 0 || tokens[0].startsWith("--")) {
+  if (tokens.length === 0 || tokens[0] === "" || tokens[0].startsWith("--")) {
     throw new CommandParseError("Usage: /cron edit <selector> [flags]");
   }
   const selector = tokens[0];
@@ -390,7 +390,7 @@ function parseSelectorCommand(
   kind: "show" | "pause" | "resume" | "run" | "delete",
   tokens: string[],
 ): CommandIntent {
-  if (tokens.length !== 1) {
+  if (tokens.length !== 1 || tokens[0] === "") {
     throw new CommandParseError(`Usage: /cron ${kind} <selector>`);
   }
   return { kind, selector: tokens[0] };
@@ -418,10 +418,16 @@ function assertSafeRecurring(value: string): void {
 }
 
 function positiveInteger(flag: string, value: string | undefined): number {
-  if (value === undefined || !/^[1-9]\d*$/.test(value)) {
+  const parsed = value === undefined ? Number.NaN : Number(value);
+  if (
+    value === undefined ||
+    !/^[1-9]\d*$/.test(value) ||
+    !Number.isSafeInteger(parsed) ||
+    parsed <= 0
+  ) {
     throw new CommandParseError(`${flag} requires a positive integer`);
   }
-  return Number(value);
+  return parsed;
 }
 
 function stringFlag(flags: ParsedFlags, flag: string): string | undefined {
