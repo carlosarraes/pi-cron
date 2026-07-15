@@ -1,18 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  chmod,
   type FileHandle,
   link,
   mkdir,
   open,
-  readFile,
   rename,
   rm,
-  stat,
 } from "node:fs/promises";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 const STALE_AFTER_MS = 90_000;
+const DEFAULT_OPERATION_LOCK_MAX_ATTEMPTS = 100;
+const DEFAULT_OPERATION_LOCK_RETRY_MS = 5;
 
 export interface LeaseRecord {
   pid: number;
@@ -25,30 +26,46 @@ export type LeaseResult =
   | { owned: true }
   | { owned: false; owner: LeaseRecord };
 
+export type LeaseOperation = "acquire" | "heartbeat" | "release";
+
 export interface RuntimeLeaseOptions {
   agentDir?: string;
   clock?: { now(): Date };
   pid?: number;
   processStartedAt?: string;
   isPidAlive?: (pid: number) => boolean;
+  operationLockMaxAttempts?: number;
+  operationLockRetryMs?: number;
+  tokenFactory?: () => string;
+  hooks?: {
+    afterOperationLockAcquired?: (
+      operation: LeaseOperation,
+    ) => void | Promise<void>;
+    beforeCanonicalPublish?: (
+      operation: "claim" | "heartbeat",
+    ) => void | Promise<void>;
+  };
 }
 
 /**
- * Signals that an instance which previously owned a lease observed that its
- * ownership record was removed or replaced. Callers must stop owner-only work.
+ * Signals that an instance which previously owned a lease can no longer prove
+ * ownership. Callers must stop owner-only work.
  */
 export class RuntimeLeaseOwnershipLostError extends Error {
-  constructor() {
-    super("Runtime lease ownership was lost");
+  constructor(cause?: unknown) {
+    super(
+      "Runtime lease ownership was lost",
+      cause === undefined ? undefined : { cause },
+    );
     this.name = "RuntimeLeaseOwnershipLostError";
   }
 }
 
 /**
- * Owns at most one session lease. heartbeat() and release() are harmless no-ops
- * for contenders which never owned. Once an owner observes a replacement,
- * heartbeat() fails closed with RuntimeLeaseOwnershipLostError; release() will
- * not remove the replacement.
+ * Owns at most one session lease. Contenders which never owned may call
+ * heartbeat() and release() as no-ops. A previous owner fails closed from
+ * heartbeat() when ownership cannot be proven; release() never removes a
+ * replacement lease.
  */
 export class RuntimeLease {
   private readonly leaseDir: string;
@@ -56,6 +73,10 @@ export class RuntimeLease {
   private readonly pid: number;
   private readonly processStartedAt: string;
   private readonly isPidAlive: (pid: number) => boolean;
+  private readonly operationLockMaxAttempts: number;
+  private readonly operationLockRetryMs: number;
+  private readonly tokenFactory: () => string;
+  private readonly hooks: NonNullable<RuntimeLeaseOptions["hooks"]>;
   private leasePath?: string;
   private record?: LeaseRecord;
   private owned = false;
@@ -73,116 +94,128 @@ export class RuntimeLease {
       options.processStartedAt ??
       new Date(Date.now() - process.uptime() * 1_000).toISOString();
     this.isPidAlive = options.isPidAlive ?? defaultIsPidAlive;
+    this.operationLockMaxAttempts =
+      options.operationLockMaxAttempts ?? DEFAULT_OPERATION_LOCK_MAX_ATTEMPTS;
+    this.operationLockRetryMs =
+      options.operationLockRetryMs ?? DEFAULT_OPERATION_LOCK_RETRY_MS;
+    this.tokenFactory = options.tokenFactory ?? randomUUID;
+    this.hooks = options.hooks ?? {};
   }
 
   async acquire(sessionId: string): Promise<LeaseResult> {
-    await mkdir(this.leaseDir, { recursive: true, mode: 0o700 });
-    this.leasePath = join(this.leaseDir, hashSessionId(sessionId));
-    this.record = this.makeRecord(sessionId);
+    if (this.owned)
+      throw new Error("RuntimeLease already owns a session lease");
+    await this.prepareLeaseDirectory();
+    const leasePath = join(this.leaseDir, hashSessionId(sessionId));
+    const record = this.makeRecord(sessionId);
+    this.leasePath = leasePath;
+    this.record = record;
 
-    try {
-      await this.writeExclusive(this.record);
-      this.markOwned();
-      return { owned: true };
-    } catch (error) {
-      if (!isNodeError(error, "EEXIST")) throw error;
-    }
-
-    const ownerSnapshot = await this.readOwnerSnapshot();
-    if (this.isLive(ownerSnapshot.record)) {
-      this.owned = false;
-      return { owned: false, owner: ownerSnapshot.record };
-    }
-
-    const stalePath = `${this.leasePath}.stale-${this.pid}-${randomUUID()}`;
-    try {
-      await rename(this.leasePath, stalePath);
-    } catch (error) {
-      if (isNodeError(error, "ENOENT")) return this.acquire(sessionId);
-      throw error;
-    }
-
-    const moved = await stat(stalePath);
-    if (!isSameFile(ownerSnapshot, moved)) {
-      await restoreMovedFile(stalePath, this.leasePath);
-      return this.acquire(sessionId);
-    }
-
-    try {
+    return this.withOperationLock("acquire", async () => {
       try {
-        await this.writeExclusive(this.record);
+        await this.publishExclusive(leasePath, record);
+        this.markOwned();
+        return { owned: true };
       } catch (error) {
         if (!isNodeError(error, "EEXIST")) throw error;
-        const winner = await this.readOwner();
-        this.owned = false;
-        return { owned: false, owner: winner };
       }
-      this.markOwned();
-      return { owned: true };
-    } finally {
-      await rm(stalePath, { force: true });
-    }
+
+      const ownerSnapshot = await readLeaseSnapshot(leasePath);
+      if (this.isLive(ownerSnapshot.record)) {
+        return { owned: false, owner: ownerSnapshot.record };
+      }
+
+      const stalePath = `${leasePath}.stale-${this.pid}-${this.tokenFactory()}`;
+      await rename(leasePath, stalePath);
+      const movedSnapshot = await readLeaseSnapshot(stalePath);
+      if (
+        !isSameFile(ownerSnapshot, movedSnapshot) ||
+        !isSameLeaseRecord(ownerSnapshot.record, movedSnapshot.record)
+      ) {
+        await restoreMovedFile(stalePath, leasePath);
+        const current = await readLeaseSnapshot(leasePath);
+        return { owned: false, owner: current.record };
+      }
+
+      try {
+        await this.publishExclusive(leasePath, record);
+        this.markOwned();
+        return { owned: true };
+      } catch (error) {
+        if (!isNodeError(error, "EEXIST")) throw error;
+        const winner = await readLeaseSnapshot(leasePath);
+        return { owned: false, owner: winner.record };
+      } finally {
+        await rm(stalePath, { force: true });
+      }
+    });
   }
 
   async heartbeat(): Promise<void> {
     if (!this.owned) {
-      if (this.previouslyOwned) throw new RuntimeLeaseOwnershipLostError();
+      if (this.previouslyOwned) this.loseOwnership();
       return;
     }
 
-    const handle = await this.openOwnedFile();
-    if (!handle) this.loseOwnership();
+    const leasePath = this.leasePath;
+    if (!leasePath) this.loseOwnership();
 
-    try {
-      const current = await readRecordFromHandle(handle);
-      if (!this.isOurRecord(current)) this.loseOwnership();
+    await this.withOperationLock("heartbeat", async () => {
+      let current: LeaseSnapshot;
+      try {
+        current = await readLeaseSnapshot(leasePath);
+      } catch (error) {
+        this.loseOwnership(error);
+      }
+      if (!this.isOurRecord(current.record)) {
+        this.loseOwnership(
+          new Error("Canonical lease belongs to another owner"),
+        );
+      }
 
-      const next = { ...current, heartbeatAt: this.clock.now().toISOString() };
-      await handle.truncate(0);
-      await handle.write(JSON.stringify(next), 0, "utf8");
-      await handle.sync();
-      await this.assertCanonicalFile(handle);
+      const next = {
+        ...current.record,
+        heartbeatAt: this.clock.now().toISOString(),
+      };
+      await this.publishReplacement(leasePath, next, "heartbeat");
       this.record = next;
-    } finally {
-      await handle.close();
-    }
+    });
   }
 
   async release(): Promise<void> {
     if (!this.owned || !this.leasePath) return;
 
-    let snapshot: LeaseSnapshot;
-    try {
-      snapshot = await this.readOwnerSnapshot();
-    } catch (error) {
-      if (isNodeError(error, "ENOENT")) {
+    const leasePath = this.leasePath;
+    await this.withOperationLock("release", async () => {
+      let current: LeaseSnapshot;
+      try {
+        current = await readLeaseSnapshot(leasePath);
+      } catch (error) {
+        this.loseOwnership(error);
+      }
+      if (!this.isOurRecord(current.record)) {
         this.owned = false;
         return;
       }
-      throw error;
-    }
 
-    if (!this.isOurRecord(snapshot.record)) {
+      const releasePath = `${leasePath}.release-${this.pid}-${this.tokenFactory()}`;
+      await rename(leasePath, releasePath);
+      const moved = await readLeaseSnapshot(releasePath);
+      if (
+        isSameFile(current, moved) &&
+        isSameLeaseRecord(current.record, moved.record)
+      ) {
+        await rm(releasePath, { force: true });
+      } else {
+        await restoreMovedFile(releasePath, leasePath);
+      }
       this.owned = false;
-      return;
-    }
+    });
+  }
 
-    const releasePath = `${this.leasePath}.release-${this.pid}-${randomUUID()}`;
-    try {
-      await rename(this.leasePath, releasePath);
-    } catch (error) {
-      if (!isNodeError(error, "ENOENT")) throw error;
-      this.owned = false;
-      return;
-    }
-
-    const moved = await stat(releasePath);
-    if (isSameFile(snapshot, moved)) {
-      await rm(releasePath, { force: true });
-    } else {
-      await restoreMovedFile(releasePath, this.leasePath);
-    }
-    this.owned = false;
+  private async prepareLeaseDirectory(): Promise<void> {
+    await mkdir(this.leaseDir, { recursive: true, mode: 0o700 });
+    await chmod(this.leaseDir, 0o700);
   }
 
   private makeRecord(sessionId: string): LeaseRecord {
@@ -194,38 +227,159 @@ export class RuntimeLease {
     };
   }
 
-  private async writeExclusive(record: LeaseRecord): Promise<void> {
-    if (!this.leasePath) throw new Error("Lease path is not initialized");
+  private async publishExclusive(
+    path: string,
+    record: LeaseRecord,
+  ): Promise<void> {
+    const temporaryPath = await this.writeCompleteTemporary(path, record);
+    try {
+      await this.hooks.beforeCanonicalPublish?.("claim");
+      await link(temporaryPath, path);
+    } finally {
+      await rm(temporaryPath, { force: true });
+    }
+  }
 
+  private async publishReplacement(
+    path: string,
+    record: LeaseRecord,
+    operation: "heartbeat",
+  ): Promise<void> {
+    const temporaryPath = await this.writeCompleteTemporary(path, record);
+    try {
+      await this.hooks.beforeCanonicalPublish?.(operation);
+      await rename(temporaryPath, path);
+    } catch (error) {
+      await rm(temporaryPath, { force: true });
+      throw error;
+    }
+  }
+
+  private async writeCompleteTemporary(
+    targetPath: string,
+    value: LeaseRecord | OperationLockRecord,
+  ): Promise<string> {
+    const temporaryPath = `${targetPath}.tmp-${this.pid}-${this.tokenFactory()}`;
     let handle: FileHandle | undefined;
     try {
-      handle = await open(this.leasePath, "wx", 0o600);
+      handle = await open(temporaryPath, "wx", 0o600);
       await handle.chmod(0o600);
-      await handle.writeFile(JSON.stringify(record), "utf8");
+      await handle.writeFile(JSON.stringify(value), "utf8");
       await handle.sync();
     } catch (error) {
-      if (handle) await rm(this.leasePath, { force: true });
+      if (handle) await rm(temporaryPath, { force: true });
       throw error;
     } finally {
       await handle?.close();
     }
+    return temporaryPath;
   }
 
-  private async readOwner(): Promise<LeaseRecord> {
-    if (!this.leasePath) throw new Error("Lease path is not initialized");
-    return parseLeaseRecord(await readFile(this.leasePath, "utf8"));
-  }
-
-  private async readOwnerSnapshot(): Promise<LeaseSnapshot> {
-    if (!this.leasePath) throw new Error("Lease path is not initialized");
-    const handle = await open(this.leasePath, "r");
+  private async withOperationLock<T>(
+    operation: LeaseOperation,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    const operationLock = await this.acquireOperationLock();
     try {
-      const record = await readRecordFromHandle(handle);
-      const { dev, ino } = await handle.stat();
-      return { record, dev, ino };
+      await this.hooks.afterOperationLockAcquired?.(operation);
+      return await action();
     } finally {
-      await handle.close();
+      await this.releaseOperationLock(operationLock);
     }
+  }
+
+  private async acquireOperationLock(): Promise<OperationLockSnapshot> {
+    const lockPath = `${this.leasePath}.lock`;
+    let lastError: unknown;
+
+    for (
+      let attempt = 0;
+      attempt < this.operationLockMaxAttempts;
+      attempt += 1
+    ) {
+      const record: OperationLockRecord = {
+        pid: this.pid,
+        processStartedAt: this.processStartedAt,
+        token: this.tokenFactory(),
+      };
+      try {
+        const temporaryPath = await this.writeCompleteTemporary(
+          lockPath,
+          record,
+        );
+        try {
+          await link(temporaryPath, lockPath);
+        } finally {
+          await rm(temporaryPath, { force: true });
+        }
+        const snapshot = await readOperationLockSnapshot(lockPath);
+        if (!isSameOperationLock(record, snapshot.record)) {
+          throw new Error("Operation lock ownership could not be verified");
+        }
+        return snapshot;
+      } catch (error) {
+        if (!isNodeError(error, "EEXIST")) throw error;
+      }
+
+      let existing: OperationLockSnapshot;
+      try {
+        existing = await readOperationLockSnapshot(lockPath);
+      } catch (error) {
+        lastError = error;
+        await delay(this.operationLockRetryMs);
+        continue;
+      }
+
+      if (this.isPidAlive(existing.record.pid)) {
+        lastError = new Error(
+          "Runtime lease operation lock is held by a live process",
+        );
+        await delay(this.operationLockRetryMs);
+        continue;
+      }
+
+      const stalePath = `${lockPath}.dead-${this.pid}-${this.tokenFactory()}`;
+      try {
+        await rename(lockPath, stalePath);
+      } catch (error) {
+        if (isNodeError(error, "ENOENT")) continue;
+        throw error;
+      }
+      const moved = await readOperationLockSnapshot(stalePath);
+      if (
+        !isSameFile(existing, moved) ||
+        !isSameOperationLock(existing.record, moved.record)
+      ) {
+        await restoreMovedFile(stalePath, lockPath);
+        lastError = new Error(
+          "Operation lock changed during dead-owner recovery",
+        );
+        await delay(this.operationLockRetryMs);
+        continue;
+      }
+      await rm(stalePath, { force: true });
+    }
+
+    throw new Error("Runtime lease operation lock unavailable", {
+      cause: lastError,
+    });
+  }
+
+  private async releaseOperationLock(
+    ownedLock: OperationLockSnapshot,
+  ): Promise<void> {
+    const lockPath = `${this.leasePath}.lock`;
+    const releasePath = `${lockPath}.release-${this.pid}-${this.tokenFactory()}`;
+    await rename(lockPath, releasePath);
+    const moved = await readOperationLockSnapshot(releasePath);
+    if (
+      !isSameFile(ownedLock, moved) ||
+      !isSameOperationLock(ownedLock.record, moved.record)
+    ) {
+      await restoreMovedFile(releasePath, lockPath);
+      throw new Error("Runtime lease operation lock ownership was lost");
+    }
+    await rm(releasePath, { force: true });
   }
 
   private isLive(owner: LeaseRecord): boolean {
@@ -242,72 +396,99 @@ export class RuntimeLease {
     );
   }
 
-  private async openOwnedFile(): Promise<FileHandle | undefined> {
-    if (!this.leasePath) return undefined;
-    try {
-      return await open(this.leasePath, "r+");
-    } catch (error) {
-      if (isNodeError(error, "ENOENT")) return undefined;
-      throw error;
-    }
-  }
-
-  private async assertCanonicalFile(handle: FileHandle): Promise<void> {
-    if (!this.leasePath) this.loseOwnership();
-    const opened = await handle.stat();
-    let canonical: { dev: number; ino: number };
-    try {
-      canonical = await stat(this.leasePath);
-    } catch (error) {
-      if (isNodeError(error, "ENOENT")) this.loseOwnership();
-      throw error;
-    }
-    if (!isSameFile(opened, canonical)) this.loseOwnership();
-  }
-
   private markOwned(): void {
     this.owned = true;
     this.previouslyOwned = true;
   }
 
-  private loseOwnership(): never {
+  private loseOwnership(cause?: unknown): never {
     this.owned = false;
-    throw new RuntimeLeaseOwnershipLostError();
+    throw new RuntimeLeaseOwnershipLostError(cause);
   }
 }
 
-interface LeaseSnapshot {
-  record: LeaseRecord;
+interface OperationLockRecord {
+  pid: number;
+  processStartedAt: string;
+  token: string;
+}
+
+interface FileSnapshot {
   dev: number;
   ino: number;
+}
+
+interface LeaseSnapshot extends FileSnapshot {
+  record: LeaseRecord;
+}
+
+interface OperationLockSnapshot extends FileSnapshot {
+  record: OperationLockRecord;
 }
 
 function hashSessionId(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex");
 }
 
-function isSameFile(
-  expected: Pick<LeaseSnapshot, "dev" | "ino">,
-  actual: Pick<LeaseSnapshot, "dev" | "ino">,
+async function readLeaseSnapshot(path: string): Promise<LeaseSnapshot> {
+  const handle = await open(path, "r");
+  try {
+    const record = parseLeaseRecord(await handle.readFile("utf8"));
+    const { dev, ino } = await handle.stat();
+    return { record, dev, ino };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readOperationLockSnapshot(
+  path: string,
+): Promise<OperationLockSnapshot> {
+  const handle = await open(path, "r");
+  try {
+    const record = parseOperationLockRecord(await handle.readFile("utf8"));
+    const { dev, ino } = await handle.stat();
+    return { record, dev, ino };
+  } finally {
+    await handle.close();
+  }
+}
+
+function isSameFile(left: FileSnapshot, right: FileSnapshot): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function isSameLeaseRecord(left: LeaseRecord, right: LeaseRecord): boolean {
+  return (
+    left.pid === right.pid &&
+    left.processStartedAt === right.processStartedAt &&
+    left.heartbeatAt === right.heartbeatAt &&
+    left.sessionId === right.sessionId
+  );
+}
+
+function isSameOperationLock(
+  left: OperationLockRecord,
+  right: OperationLockRecord,
 ): boolean {
-  return expected.dev === actual.dev && expected.ino === actual.ino;
+  return (
+    left.pid === right.pid &&
+    left.processStartedAt === right.processStartedAt &&
+    left.token === right.token
+  );
 }
 
 async function restoreMovedFile(
   movedPath: string,
-  leasePath: string,
+  canonicalPath: string,
 ): Promise<void> {
   try {
-    await link(movedPath, leasePath);
+    await link(movedPath, canonicalPath);
   } catch (error) {
     if (isNodeError(error, "EEXIST")) return;
     throw error;
   }
   await rm(movedPath, { force: true });
-}
-
-async function readRecordFromHandle(handle: FileHandle): Promise<LeaseRecord> {
-  return parseLeaseRecord(await handle.readFile("utf8"));
 }
 
 function parseLeaseRecord(value: string): LeaseRecord {
@@ -320,9 +501,9 @@ function parseLeaseRecord(value: string): LeaseRecord {
     !Number.isInteger(parsed.pid) ||
     parsed.pid <= 0 ||
     !("processStartedAt" in parsed) ||
-    !isTimestamp(parsed.processStartedAt) ||
+    !isIsoTimestamp(parsed.processStartedAt) ||
     !("heartbeatAt" in parsed) ||
-    !isTimestamp(parsed.heartbeatAt) ||
+    !isIsoTimestamp(parsed.heartbeatAt) ||
     !("sessionId" in parsed) ||
     typeof parsed.sessionId !== "string"
   ) {
@@ -331,8 +512,35 @@ function parseLeaseRecord(value: string): LeaseRecord {
   return parsed as LeaseRecord;
 }
 
-function isTimestamp(value: unknown): value is string {
-  return typeof value === "string" && !Number.isNaN(Date.parse(value));
+function parseOperationLockRecord(value: string): OperationLockRecord {
+  const parsed: unknown = JSON.parse(value);
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    !("pid" in parsed) ||
+    typeof parsed.pid !== "number" ||
+    !Number.isInteger(parsed.pid) ||
+    parsed.pid <= 0 ||
+    !("processStartedAt" in parsed) ||
+    !isIsoTimestamp(parsed.processStartedAt) ||
+    !("token" in parsed) ||
+    typeof parsed.token !== "string" ||
+    parsed.token.length === 0
+  ) {
+    throw new Error("Invalid runtime lease operation lock record");
+  }
+  return parsed as OperationLockRecord;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
+  ) {
+    return false;
+  }
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }
 
 function defaultIsPidAlive(pid: number): boolean {
@@ -344,6 +552,10 @@ function defaultIsPidAlive(pid: number): boolean {
     if (isNodeError(error, "EPERM")) return true;
     throw error;
   }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isNodeError(
