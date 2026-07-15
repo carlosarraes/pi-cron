@@ -1,0 +1,36 @@
+{
+  "name": "pi-cron",
+  "version": "0.1.0",
+  "description": "Session-scoped fixed, adaptive, cron, and one-shot prompt scheduling for Pi",
+  "type": "module",
+  "license": "MIT",
+  "author": "carraes",
+  "keywords": ["pi-package", "pi-extension", "cron", "scheduler", "loop"],
+  "files": ["src", "README.md", "LICENSE"],
+  "pi": { "extensions": ["./src/index.ts"] },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src test",
+    "lint:fix": "biome check --write src test",
+    "check": "npm run lint && npm run typecheck && npm test"
+  },
+  "dependencies": { "croner": "^10.0.1" },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.80.0",
+    "@earendil-works/pi-coding-agent": ">=0.80.0",
+    "@earendil-works/pi-tui": ">=0.80.0",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.8",
+    "@earendil-works/pi-ai": "^0.80.0",
+    "@earendil-works/pi-coding-agent": "^0.80.0",
+    "@earendil-works/pi-tui": "^0.80.0",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.0.0",
+    "typescript": "^6.0.0",
+    "vitest": "^4.0.0"
+  }
+}
