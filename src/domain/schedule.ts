@@ -41,7 +41,13 @@ export function resolveSchedule(
       if (!unsafeSeconds && intervalMs < DEFAULT_LIMITS.minRecurringMs) {
         throw new ScheduleError("Recurring intervals must be at least 1m.");
       }
-      return { kind: "interval", intervalMs, anchorAt: now.toISOString() };
+      const anchor = checkedDate(now.getTime());
+      checkedDate(anchor.getTime() + intervalMs);
+      return {
+        kind: "interval",
+        intervalMs,
+        anchorAt: anchor.toISOString(),
+      };
     }
     case "cron":
       validateTimezone(timezone);
@@ -50,7 +56,9 @@ export function resolveSchedule(
     case "in":
       return {
         kind: "once",
-        at: new Date(now.getTime() + parseDuration(input.value)).toISOString(),
+        at: checkedDate(
+          now.getTime() + parseDuration(input.value),
+        ).toISOString(),
         original: input.value,
       };
     case "at": {
@@ -63,14 +71,14 @@ export function resolveSchedule(
       }
       return {
         kind: "once",
-        at: new Date(timestamp).toISOString(),
+        at: checkedDate(timestamp).toISOString(),
         original: input.value,
       };
     }
     case "adaptive":
       return {
         kind: "adaptive",
-        nextWakeAt: new Date(
+        nextWakeAt: checkedDate(
           now.getTime() + DEFAULT_LIMITS.minRecurringMs,
         ).toISOString(),
         fallbackUsed: false,
@@ -120,7 +128,7 @@ function nextInterval(anchorAt: string, intervalMs: number, after: Date): Date {
   const anchor = Date.parse(anchorAt);
   const elapsed = Math.max(0, after.getTime() - anchor);
   const occurrence = Math.floor(elapsed / intervalMs) + 1;
-  return new Date(anchor + occurrence * intervalMs);
+  return checkedDate(anchor + occurrence * intervalMs);
 }
 
 function nextCron(
@@ -169,7 +177,22 @@ function validateTimezone(timezone: string): void {
 
 function futureDate(value: string, after: Date): Date | null {
   const timestamp = Date.parse(value);
-  return timestamp > after.getTime() ? new Date(timestamp) : null;
+  return timestamp > after.getTime() ? checkedDate(timestamp) : null;
+}
+
+function checkedDate(timestamp: number): Date {
+  if (!Number.isFinite(timestamp)) {
+    throw new ScheduleError(
+      "Schedule timestamp is outside the supported date range.",
+    );
+  }
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) {
+    throw new ScheduleError(
+      "Schedule timestamp is outside the supported date range.",
+    );
+  }
+  return date;
 }
 
 function formatDuration(durationMs: number): string {

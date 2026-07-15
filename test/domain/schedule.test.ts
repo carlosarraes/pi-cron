@@ -65,6 +65,12 @@ describe("resolveSchedule", () => {
     });
   });
 
+  it("rejects an interval whose first occurrence exceeds the date range", () => {
+    expect(() =>
+      resolveSchedule({ kind: "interval", value: "100000000d" }, now),
+    ).toThrowError(ScheduleError);
+  });
+
   it("resolves relative and absolute one-shots", () => {
     expect(resolveSchedule({ kind: "in", value: "20m" }, now)).toEqual({
       kind: "once",
@@ -87,6 +93,12 @@ describe("resolveSchedule", () => {
     expect(() =>
       resolveSchedule({ kind: "at", value: now.toISOString() }, now),
     ).toThrowError(/future/);
+  });
+
+  it("rejects a relative one-shot outside the date range", () => {
+    expect(() =>
+      resolveSchedule({ kind: "in", value: "100000000d" }, now),
+    ).toThrowError(ScheduleError);
   });
 
   it("gives adaptive schedules a bounded first wake", () => {
@@ -150,6 +162,19 @@ describe("nextOccurrence", () => {
         new Date("2026-07-14T16:31:00.000Z"),
       )?.toISOString(),
     ).toBe("2026-07-14T18:00:00.000Z");
+  });
+
+  it("defensively rejects an interval occurrence outside the date range", () => {
+    expect(() =>
+      nextOccurrence(
+        {
+          kind: "interval",
+          intervalMs: 8_640_000_000_000_000,
+          anchorAt: "2026-07-14T12:00:00.000Z",
+        },
+        new Date("2026-07-14T12:00:00.000Z"),
+      ),
+    ).toThrowError(ScheduleError);
   });
 
   it("uses five-part cron in the stored IANA timezone", () => {
