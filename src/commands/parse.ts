@@ -55,7 +55,7 @@ export type ExecutionDraft =
       kind: "isolated";
       model?: string;
       effort?: IsolatedExecution["effort"];
-      notify?: true;
+      notify?: boolean;
       timeout?: string;
       tools?: string[];
       skills?: string[];
