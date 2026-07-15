@@ -77,7 +77,8 @@ describe("selectJob", () => {
     expect(selectJob([nameMatch, idMatch], "abcd1234").id).toBe(idMatch.id);
   });
 
-  it("rejects ambiguous and missing prefixes", () => {
+  it("rejects empty, ambiguous, and missing selectors", () => {
+    expect(() => selectJob([jobs[0]], "   ")).toThrow("cannot be empty");
     expect(() => selectJob(jobs, "abcd")).toThrow("Ambiguous job selector");
     expect(() => selectJob(jobs, "missing")).toThrow("Cron job not found");
   });

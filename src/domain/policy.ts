@@ -20,6 +20,9 @@ const EFFORT_RANK: Record<
 
 export function selectJob(jobs: Iterable<CronJob>, selector: string): CronJob {
   const normalized = selector.trim().toLowerCase();
+  if (normalized.length === 0) {
+    throw new Error("Cron job selector cannot be empty");
+  }
   const candidates = [...jobs];
   const exactId = candidates.find((job) => job.id.toLowerCase() === normalized);
   if (exactId) return exactId;

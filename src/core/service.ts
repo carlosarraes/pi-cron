@@ -20,6 +20,13 @@ import {
 } from "../domain/types.js";
 
 const MAX_ID_ATTEMPTS = 16;
+const TECHNICAL_OUTCOMES = new Set<TechnicalOutcome>([
+  "dispatched",
+  "settled",
+  "failed",
+  "timed_out",
+  "aborted",
+]);
 
 export interface JobDraft {
   name?: string;
@@ -241,14 +248,21 @@ export class CronService {
         return;
       }
 
+      const runCount = before.runCount + 1;
+      const attributedTokens = before.attributedTokens + result.tokens;
+      const consecutiveFailures = nextFailureCount(
+        before.consecutiveFailures,
+        result.outcome,
+      );
+      validateCounter("runCount", runCount);
+      validateCounter("attributedTokens", attributedTokens);
+      validateCounter("consecutiveFailures", consecutiveFailures);
+
       const after: CronJob = {
         ...before,
-        runCount: before.runCount + 1,
-        attributedTokens: before.attributedTokens + result.tokens,
-        consecutiveFailures: nextFailureCount(
-          before.consecutiveFailures,
-          result.outcome,
-        ),
+        runCount,
+        attributedTokens,
+        consecutiveFailures,
         lastOccurrenceAt: scheduledAtIso,
         lastTechnicalOutcome: result.outcome,
       };
@@ -662,8 +676,17 @@ function validateRunInput(result: DispatchResult, scheduledAt: Date): void {
   if (!Number.isFinite(scheduledAt.getTime())) {
     throw new Error("Run schedule timestamp is invalid");
   }
+  if (!TECHNICAL_OUTCOMES.has(result.outcome)) {
+    throw new Error(`Invalid run outcome: ${String(result.outcome)}`);
+  }
   if (!Number.isFinite(result.tokens) || result.tokens < 0) {
     throw new Error("Run token count must be a non-negative finite number");
+  }
+}
+
+function validateCounter(label: string, value: number): void {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative finite counter`);
   }
 }
 

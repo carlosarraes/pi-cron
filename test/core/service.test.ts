@@ -4,6 +4,7 @@ import type {
   ApprovalPort,
   CronEvent,
   CronJob,
+  DispatchResult,
   EventStore,
   ProposedJob,
 } from "../../src/domain/types.js";
@@ -546,6 +547,58 @@ describe("CronService execution authorization", () => {
 });
 
 describe("CronService metrics and observers", () => {
+  it("rejects unknown outcomes without changing registry, dirtiness, or observers", async () => {
+    const existing = storedJob();
+    const changed = vi.fn();
+    const { service } = makeService({
+      events: [created(existing)],
+      onChanged: changed,
+    });
+    const before = service.list();
+    const malformed = {
+      outcome: "unknown",
+      tokens: 1,
+    } as unknown as DispatchResult;
+
+    await expect(
+      service.recordRun(
+        existing.id,
+        malformed,
+        new Date("2026-07-14T13:00:00.000Z"),
+      ),
+    ).rejects.toThrow("outcome");
+
+    expect(service.list()).toEqual(before);
+    expect(service.shouldFlushCheckpoint({ maxRuns: 0, maxAgeMs: 0 })).toBe(
+      false,
+    );
+    expect(changed).not.toHaveBeenCalled();
+  });
+
+  it("rejects aggregate counter overflow before publishing metrics", async () => {
+    const existing = storedJob({ attributedTokens: Number.MAX_VALUE });
+    const changed = vi.fn();
+    const { service } = makeService({
+      events: [created(existing)],
+      onChanged: changed,
+    });
+    const before = service.list();
+
+    await expect(
+      service.recordRun(
+        existing.id,
+        { outcome: "settled", tokens: Number.MAX_VALUE },
+        new Date("2026-07-14T13:00:00.000Z"),
+      ),
+    ).rejects.toThrow("attributedTokens");
+
+    expect(service.list()).toEqual(before);
+    expect(service.shouldFlushCheckpoint({ maxRuns: 0, maxAgeMs: 0 })).toBe(
+      false,
+    );
+    expect(changed).not.toHaveBeenCalled();
+  });
+
   it("distinguishes interim dispatch from final settlement timestamps", async () => {
     const existing = storedJob();
     const { service, clock } = makeService({ events: [created(existing)] });
