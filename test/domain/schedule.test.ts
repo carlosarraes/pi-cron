@@ -29,6 +29,13 @@ describe("parseDuration", () => {
       new ScheduleError(`Invalid duration '${value}'. Use 30m, 2h, or 1d.`),
     );
   });
+
+  it.each([
+    `${"9".repeat(400)}s`,
+    "9007199254741d",
+  ])("rejects overflowing duration %j", (value) => {
+    expect(() => parseDuration(value)).toThrowError(ScheduleError);
+  });
 });
 
 describe("resolveSchedule", () => {

@@ -21,7 +21,12 @@ export function parseDuration(value: string): number {
   if (!match) {
     throw new ScheduleError(`Invalid duration '${value}'. Use 30m, 2h, or 1d.`);
   }
-  return Number(match[1]) * UNIT_MS[match[2] as keyof typeof UNIT_MS];
+  const durationMs =
+    Number(match[1]) * UNIT_MS[match[2] as keyof typeof UNIT_MS];
+  if (!Number.isSafeInteger(durationMs) || durationMs <= 0) {
+    throw new ScheduleError(`Invalid duration '${value}'. Use 30m, 2h, or 1d.`);
+  }
+  return durationMs;
 }
 
 export function resolveSchedule(
