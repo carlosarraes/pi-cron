@@ -200,7 +200,7 @@ export class IsolatedExecutor {
         modelRegistry: this.options.modelRegistry,
         model,
         thinkingLevel: execution.effort,
-        tools: [...execution.tools],
+        tools: [...execution.tools, ...(adaptiveTool ? ["cron_wakeup"] : [])],
         customTools: adaptiveTool ? [adaptiveTool] : [],
         resourceLoader,
       });

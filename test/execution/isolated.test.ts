@@ -382,6 +382,7 @@ describe("IsolatedExecutor", () => {
     });
     const result = executor.execute(adaptive, new Date(NOW));
     await settleAsync();
+    expect(captured[0]?.tools).toEqual(["read", "cron_wakeup"]);
     const tools = captured[0]?.customTools as Array<{
       execute: (
         id: string,

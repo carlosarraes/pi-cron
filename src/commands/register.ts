@@ -174,12 +174,12 @@ async function dispatchCronIntent(
     }
     case "stop_all":
       runtime.assertWritable?.();
-      await runtime.stopAll();
       for (const job of service
         .list()
         .filter((candidate) => candidate.state === "active")) {
         await service.pause(job.id, "Stopped by /cron stop --all");
       }
+      await runtime.stopAll();
       notify(ctx, "Stopped all cron jobs");
   }
 }

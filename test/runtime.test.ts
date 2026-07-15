@@ -265,6 +265,17 @@ describe("CronRuntime", () => {
     expect(configured.intervals.size).toBe(1);
   });
 
+  it("stop-all clears pending work but leaves scheduling restartable", async () => {
+    const configured = setup({ entries: [customEntry(event())] });
+    await configured.start();
+    await configured.runtime.requireService().pause("job-1", "stop all");
+    await configured.runtime.stopAll();
+    expect(configured.clock.pendingTimerCount()).toBe(0);
+
+    await configured.runtime.requireService().resume("job-1");
+    expect(configured.clock.pendingTimerCount()).toBe(1);
+  });
+
   it("shutdown clears scheduler, heartbeat, lease, and footer", async () => {
     const configured = setup({ entries: [customEntry(event())] });
     await configured.start();

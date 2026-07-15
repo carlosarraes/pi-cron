@@ -67,6 +67,7 @@ export class CronRuntime implements CronRuntimeRef {
   private scheduler: Scheduler | undefined;
   private mainExecutor: MainExecutor | undefined;
   private isolatedExecutor: IsolatedExecutor | undefined;
+  private promptResolver: PromptResolver | undefined;
   private lease: LeasePort | undefined;
   private heartbeatHandle: unknown;
   private ctx: ExtensionContext | undefined;
@@ -208,8 +209,19 @@ export class CronRuntime implements CronRuntimeRef {
   }
 
   async stopAll(): Promise<void> {
-    this.scheduler?.stop();
+    const scheduler = this.scheduler;
+    const hadIsolatedRun = !(this.isolatedExecutor?.isIdle() ?? true);
+    scheduler?.stop();
     await this.isolatedExecutor?.abortAll();
+    if (hadIsolatedRun) await scheduler?.waitForIdle();
+    if (this.ctx && this.promptResolver && this.service) {
+      this.isolatedExecutor = this.createIsolatedExecutor(
+        this.ctx,
+        this.service,
+        this.promptResolver,
+      );
+    }
+    scheduler?.start();
     this.refreshUi();
   }
 
@@ -251,6 +263,7 @@ export class CronRuntime implements CronRuntimeRef {
     this.scheduler = undefined;
     this.mainExecutor = undefined;
     this.isolatedExecutor = undefined;
+    this.promptResolver = undefined;
     this.service = undefined;
     this.lease = undefined;
     this.ctx = undefined;
@@ -266,6 +279,7 @@ export class CronRuntime implements CronRuntimeRef {
       agentDir: getAgentDir(),
       isProjectTrusted: () => ctx.isProjectTrusted(),
     });
+    this.promptResolver = resolver;
     this.mainExecutor = new MainExecutor({
       pi: this.pi,
       service,
@@ -273,15 +287,7 @@ export class CronRuntime implements CronRuntimeRef {
       clock: this.clock,
       readUsage: () => ctx.getContextUsage()?.tokens ?? 0,
     });
-    this.isolatedExecutor = new IsolatedExecutor({
-      cwd: ctx.cwd,
-      agentDir: getAgentDir(),
-      modelRegistry: ctx.modelRegistry,
-      pi: this.pi,
-      service,
-      resolver,
-      now: () => this.clock.now(),
-    });
+    this.isolatedExecutor = this.createIsolatedExecutor(ctx, service, resolver);
     const dispatcher: Dispatcher = {
       isIdle: () =>
         ctx.isIdle() &&
@@ -294,6 +300,22 @@ export class CronRuntime implements CronRuntimeRef {
       dispatcher,
       clock: this.clock,
       onError: (error) => this.notifyError(error),
+    });
+  }
+
+  private createIsolatedExecutor(
+    ctx: ExtensionContext,
+    service: CronService,
+    resolver: PromptResolver,
+  ): IsolatedExecutor {
+    return new IsolatedExecutor({
+      cwd: ctx.cwd,
+      agentDir: getAgentDir(),
+      modelRegistry: ctx.modelRegistry,
+      pi: this.pi,
+      service,
+      resolver,
+      now: () => this.clock.now(),
     });
   }
 
