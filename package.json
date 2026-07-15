@@ -5,6 +5,13 @@
   "type": "module",
   "license": "MIT",
   "author": "carraes",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/carlosarraes/pi-cron.git"
+  },
+  "homepage": "https://github.com/carlosarraes/pi-cron#readme",
+  "bugs": "https://github.com/carlosarraes/pi-cron/issues",
+  "engines": { "node": ">=22" },
   "keywords": ["pi-package", "pi-extension", "cron", "scheduler", "loop"],
   "files": ["src", "README.md", "LICENSE"],
   "pi": { "extensions": ["./src/index.ts"] },
