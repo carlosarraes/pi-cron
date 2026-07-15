@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build and test output
+dist/
+coverage/
+*.tgz
+
+# Local Pi/agent artifacts
+.pi/
+.pi-subagents/
+.superpowers/
+
+# Local design and implementation notes
+docs/superpowers/
+
+# Editor and OS files
+.DS_Store
+*.swp
