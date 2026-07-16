@@ -135,6 +135,25 @@ function deferred<T>() {
 }
 
 describe("CronService creation and validation", () => {
+  it("delivers change notifications after the durable mutation barrier clears", async () => {
+    let service!: CronService;
+    let executionToken: string | undefined;
+    const observerError = vi.fn();
+    ({ service } = makeService({
+      onChanged: () => {
+        executionToken = service.beginExecution("deadbeef", false);
+      },
+      onObserverError: observerError,
+    }));
+
+    await service.create(validDraft());
+
+    expect(executionToken).toEqual(expect.any(String));
+    expect(observerError).not.toHaveBeenCalled();
+    if (!executionToken) throw new Error("execution token was not created");
+    service.endExecution(executionToken);
+  });
+
   it("creates an approved job with normalized defaults after durable append", async () => {
     let appendedAtNotification = 0;
     const store = new MemoryStore();

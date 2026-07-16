@@ -244,6 +244,28 @@ describe("CronRuntime", () => {
     expect(configured.clock.pendingTimerCount()).toBe(0);
   });
 
+  it("starts a newly created recurring job after its durable mutation settles", async () => {
+    const configured = setup({ entries: [] });
+    await configured.start();
+
+    await configured.runtime.requireService().create({
+      name: "Immediate",
+      prompt: { kind: "text", text: "Run immediately" },
+      schedule: {
+        kind: "interval",
+        intervalMs: 2 * 60 * 60_000,
+        anchorAt: NOW,
+      },
+      execution: { kind: "main" },
+    });
+    await settleAsync();
+
+    expect(configured.sent).toEqual(["Run immediately"]);
+    expect(configured.notifications).not.toContain(
+      "pi-cron: Cannot begin execution while a durable mutation is pending",
+    );
+  });
+
   it("bridges main dispatch through agent settlement and records the run", async () => {
     const configured = setup({ entries: [customEntry(event())] });
     await configured.start();

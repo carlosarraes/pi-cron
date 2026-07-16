@@ -84,6 +84,7 @@ export class CronService {
   private dirtySinceMs: number | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
   private pendingMutationCount = 0;
+  private changeNotificationPending = false;
 
   private readonly store: EventStore;
   private readonly approvals: ApprovalPort;
@@ -434,11 +435,11 @@ export class CronService {
     );
     return run.then(
       (value) => {
-        this.pendingMutationCount -= 1;
+        this.finishMutation();
         return value;
       },
       (error: unknown) => {
-        this.pendingMutationCount -= 1;
+        this.finishMutation();
         throw error;
       },
     );
@@ -537,7 +538,23 @@ export class CronService {
     this.notifyChanged();
   }
 
+  private finishMutation(): void {
+    this.pendingMutationCount -= 1;
+    if (this.pendingMutationCount === 0 && this.changeNotificationPending) {
+      this.changeNotificationPending = false;
+      this.deliverChangedNotification();
+    }
+  }
+
   private notifyChanged(): void {
+    if (this.pendingMutationCount > 0) {
+      this.changeNotificationPending = true;
+      return;
+    }
+    this.deliverChangedNotification();
+  }
+
+  private deliverChangedNotification(): void {
     try {
       this.onChanged?.();
     } catch (error) {
