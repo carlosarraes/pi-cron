@@ -149,8 +149,10 @@ describe("CronRuntime", () => {
   it("replays the active branch, acquires the lease, starts one scheduler timer, and sets footer", async () => {
     const configured = setup({ entries: [customEntry(event())] });
     await configured.start();
+    await settleAsync();
 
     expect(configured.runtime.requireService().list()).toHaveLength(1);
+    expect(configured.sent).toEqual(["Run report"]);
     expect(configured.lease.acquired).toEqual(["session-1"]);
     expect(configured.clock.pendingTimerCount()).toBe(1);
     expect(configured.intervals.size).toBe(1);

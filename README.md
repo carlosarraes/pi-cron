@@ -27,7 +27,7 @@ The first duration token creates a fixed interval. Everything after it, includin
 using the current branch state.
 ```
 
-Other non-empty free text creates an adaptive job:
+`/cron 2h ...` runs once immediately, then follows its anchored two-hour cadence. Other non-empty free text creates an adaptive job, which also runs immediately once:
 
 ```text
 /cron tend this PR until it is ready
@@ -74,7 +74,7 @@ Back navigation retains entered values. Cancelling mutates nothing. Guided creat
 /cron add --every 1d --prompt "daily review"
 ```
 
-Intervals stay anchored to their creation time. A delayed run does not shift future cadence.
+Intervals run once immediately, then stay anchored to their creation time. A delayed run does not shift future cadence or produce catch-up bursts.
 
 ### Cron
 
@@ -90,7 +90,7 @@ Example:
 /cron add --cron "0 9 * * 1-5" --prompt "weekday brief"
 ```
 
-The system IANA timezone is captured at creation. Day-of-month and day-of-week use traditional Vixie OR behavior. There is no jitter, seconds field, or non-standard `L`, `W`, `?`, or `#` syntax.
+Cron expressions do not receive an immediate first run; they wait for the next calendar match. The system IANA timezone is captured at creation. Day-of-month and day-of-week use traditional Vixie OR behavior. There is no jitter, seconds field, or non-standard `L`, `W`, `?`, or `#` syntax.
 
 ### One-shots
 
@@ -99,7 +99,7 @@ The system IANA timezone is captured at creation. Day-of-month and day-of-week u
 /cron add --at "2026-07-15T16:00:00Z" --prompt "prepare release"
 ```
 
-A one-shot fires at most once. If its time passes while Pi is not running, it is classified as **missed** on resume instead of firing late.
+One-shots do not receive an immediate first run. A one-shot fires at most once at its specified time. If its time passes while Pi is not running, it is classified as **missed** on resume instead of firing late.
 
 ### Adaptive
 
@@ -107,7 +107,7 @@ A one-shot fires at most once. If its time passes while Pi is not running, it is
 /cron add --adaptive --prompt "monitor this PR and decide when to check again"
 ```
 
-During each adaptive run the agent must call `cron_wakeup` with either a delay from `1m` through `1h`, or `stop: true`, plus a reason. One omission gets a 20-minute fallback; a second consecutive omission pauses the job.
+An adaptive job runs immediately once. During each run the agent must call `cron_wakeup` with either a delay from `1m` through `1h`, or `stop: true`, plus a reason. One omission gets a 20-minute fallback; a second consecutive omission pauses the job.
 
 ## Execution modes
 
@@ -164,7 +164,7 @@ Or a fixed maintenance cadence:
 /cron loop 15m
 ```
 
-Maintenance content is resolved at fire time in this order:
+Both forms run once immediately. Adaptive maintenance then chooses its next wakeup; fixed maintenance follows its anchored interval. Maintenance content is resolved at fire time in this order:
 
 1. trusted project file: `.pi/cron.md`
 2. global file: `~/.pi/agent/cron.md`

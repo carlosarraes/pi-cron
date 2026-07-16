@@ -25,13 +25,24 @@ function job(
     createdAt: NOW,
     updatedAt: NOW,
     expiresAt: "2026-07-22T10:00:00.000Z",
-    runCount: 0,
+    runCount: 1,
     attributedTokens: 0,
+    lastOccurrenceAt: NOW,
     consecutiveFailures: 0,
     approval: { approvedAt: NOW, fingerprint: "ok" },
     originSessionId: "session",
     ...overrides,
   };
+}
+
+function neverRunJob(
+  id: string,
+  schedule: CronJob["schedule"],
+  overrides: Partial<CronJob> = {},
+): CronJob {
+  const current = job(id, 60_000, overrides);
+  delete current.lastOccurrenceAt;
+  return { ...current, schedule, runCount: 0 };
 }
 
 class FakeService implements SchedulerService {
@@ -123,6 +134,168 @@ function deferred<T>() {
 }
 
 describe("Scheduler", () => {
+  it("dispatches a never-run interval immediately and keeps its anchor", async () => {
+    const { scheduler, clock, dispatcher } = harness([
+      neverRunJob("interval", {
+        kind: "interval",
+        intervalMs: 2 * 60 * 60_000,
+        anchorAt: NOW,
+      }),
+    ]);
+
+    scheduler.start();
+    await settleAsync();
+
+    expect(dispatcher.calls.map((call) => call.at.toISOString())).toEqual([
+      NOW,
+    ]);
+    expect(scheduler.nextDue()?.at.toISOString()).toBe(
+      "2026-07-15T12:00:00.000Z",
+    );
+    expect(clock.pendingTimerCount()).toBe(1);
+  });
+
+  it.each<[string, CronJob["schedule"]]>([
+    [
+      "adaptive",
+      {
+        kind: "adaptive",
+        nextWakeAt: "2026-07-15T10:01:00.000Z",
+        fallbackUsed: false,
+      },
+    ],
+    ["maintenance adaptive", { kind: "maintenance", cadence: "adaptive" }],
+    [
+      "maintenance interval",
+      {
+        kind: "maintenance",
+        cadence: { intervalMs: 15 * 60_000, anchorAt: NOW },
+      },
+    ],
+  ])("dispatches never-run %s jobs immediately", async (_name, schedule) => {
+    const { scheduler, dispatcher } = harness([neverRunJob("job-1", schedule)]);
+
+    scheduler.start();
+    await settleAsync();
+
+    expect(dispatcher.calls[0]?.at.toISOString()).toBe(NOW);
+  });
+
+  it.each<[string, CronJob["schedule"]]>([
+    ["cron", { kind: "cron", expression: "0 12 * * *", timezone: "UTC" }],
+    [
+      "once",
+      {
+        kind: "once",
+        at: "2026-07-15T12:00:00.000Z",
+        original: "2h",
+      },
+    ],
+  ])("does not immediately dispatch never-run %s jobs", async (_name, schedule) => {
+    const { scheduler, dispatcher } = harness([neverRunJob("job-1", schedule)]);
+
+    scheduler.start();
+    await settleAsync();
+
+    expect(dispatcher.calls).toEqual([]);
+  });
+
+  it("coalesces a busy initial occurrence and never duplicates it on refresh", async () => {
+    const { scheduler, dispatcher } = harness([
+      neverRunJob("job-1", {
+        kind: "interval",
+        intervalMs: 2 * 60 * 60_000,
+        anchorAt: NOW,
+      }),
+    ]);
+    dispatcher.idle = false;
+
+    scheduler.start();
+    scheduler.refresh();
+    scheduler.refresh();
+
+    expect(scheduler.getRuntimeStatus("job-1")).toEqual({
+      state: "pending",
+      pendingSince: NOW,
+    });
+
+    dispatcher.idle = true;
+    await scheduler.onAgentSettled();
+    await settleAsync();
+    expect(dispatcher.calls).toHaveLength(1);
+  });
+
+  it("cancels an unstarted initial run on pause and requeues it on resume", async () => {
+    const initial = neverRunJob("job-1", {
+      kind: "interval",
+      intervalMs: 2 * 60 * 60_000,
+      anchorAt: NOW,
+    });
+    const { scheduler, dispatcher, service } = harness([initial]);
+    dispatcher.idle = false;
+    scheduler.start();
+    expect(scheduler.getRuntimeStatus("job-1").state).toBe("pending");
+
+    service.jobs.set("job-1", { ...initial, state: "paused" });
+    scheduler.refresh();
+    expect(scheduler.getRuntimeStatus("job-1").state).toBe("idle");
+
+    service.jobs.set("job-1", { ...initial, state: "active" });
+    scheduler.refresh();
+    expect(scheduler.getRuntimeStatus("job-1").state).toBe("pending");
+
+    dispatcher.idle = true;
+    await scheduler.onAgentSettled();
+    await settleAsync();
+    expect(dispatcher.calls).toHaveLength(1);
+  });
+
+  it("preserves one later occurrence that becomes due during the initial run", async () => {
+    const { scheduler, clock, dispatcher } = harness([
+      neverRunJob("slow-initial", {
+        kind: "interval",
+        intervalMs: 60_000,
+        anchorAt: NOW,
+      }),
+    ]);
+    const gate = deferred<DispatchResult>();
+    let calls = 0;
+    dispatcher.executeImpl = async () => {
+      calls += 1;
+      return calls === 1 ? gate.promise : { outcome: "settled", tokens: 0 };
+    };
+
+    scheduler.start();
+    await settleAsync();
+    clock.advanceBy(3 * 60_000);
+    await settleAsync();
+    gate.resolve({ outcome: "settled", tokens: 0 });
+    await settleAsync();
+
+    expect(dispatcher.calls.map((call) => call.at.toISOString())).toEqual([
+      NOW,
+      "2026-07-15T10:01:00.000Z",
+    ]);
+  });
+
+  it("does not add another immediate run after the first occurrence is recorded", async () => {
+    const { scheduler, dispatcher } = harness([
+      neverRunJob("job-1", {
+        kind: "interval",
+        intervalMs: 2 * 60 * 60_000,
+        anchorAt: NOW,
+      }),
+    ]);
+    scheduler.start();
+    await settleAsync();
+    expect(dispatcher.calls).toHaveLength(1);
+
+    scheduler.stop();
+    scheduler.start();
+    await settleAsync();
+    expect(dispatcher.calls).toHaveLength(1);
+  });
+
   it("arms one timer for the nearest eligible occurrence", async () => {
     const { scheduler, clock, dispatcher } = harness([
       job("later", 120_000),

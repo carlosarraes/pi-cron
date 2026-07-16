@@ -42,6 +42,7 @@ export class Scheduler {
   private readonly onError: (error: unknown) => void;
   private readonly occurrences = new Map<string, Date>();
   private readonly pending = new Map<string, Date>();
+  private readonly initialQueued = new Set<string>();
   private timer: unknown;
   private runningJobId: string | undefined;
   private runningStartedAt: Date | undefined;
@@ -66,6 +67,7 @@ export class Scheduler {
     this.clearTimer();
     this.occurrences.clear();
     this.pending.clear();
+    this.initialQueued.clear();
   }
 
   refresh(): void {
@@ -74,12 +76,42 @@ export class Scheduler {
     if (!this.started) return;
 
     const now = this.clock.now();
+    const eligibleIds = new Set<string>();
     for (const job of this.service.list()) {
       if (!isEligible(job, now)) continue;
+      eligibleIds.add(job.id);
+
+      if (hasRecordedOccurrence(job)) {
+        this.initialQueued.delete(job.id);
+      } else if (
+        supportsImmediateFirst(job) &&
+        !this.initialQueued.has(job.id) &&
+        !this.pending.has(job.id) &&
+        this.runningJobId !== job.id
+      ) {
+        this.initialQueued.add(job.id);
+        this.pending.set(job.id, initialOccurrence(job));
+      }
+
       const next = nextOccurrence(job.schedule, now);
       if (next) this.occurrences.set(job.id, next);
     }
+
+    for (const jobId of [...this.pending.keys()]) {
+      if (!eligibleIds.has(jobId)) this.pending.delete(jobId);
+    }
+    for (const jobId of [...this.initialQueued]) {
+      if (!eligibleIds.has(jobId)) this.initialQueued.delete(jobId);
+    }
+
     this.armNearest();
+    if (
+      this.pending.size > 0 &&
+      !this.runningJobId &&
+      this.dispatcher.isIdle()
+    ) {
+      void this.requestDrain().catch(this.onError);
+    }
   }
 
   async onAgentSettled(): Promise<void> {
@@ -205,6 +237,31 @@ export class Scheduler {
     if (this.timer !== undefined) this.clock.clearTimeout(this.timer);
     this.timer = undefined;
   }
+}
+
+function supportsImmediateFirst(job: CronJob): boolean {
+  return (
+    job.schedule.kind === "interval" ||
+    job.schedule.kind === "adaptive" ||
+    job.schedule.kind === "maintenance"
+  );
+}
+
+function hasRecordedOccurrence(job: CronJob): boolean {
+  return job.runCount > 0 || job.lastOccurrenceAt !== undefined;
+}
+
+function initialOccurrence(job: CronJob): Date {
+  if (job.schedule.kind === "interval") {
+    return new Date(job.schedule.anchorAt);
+  }
+  if (
+    job.schedule.kind === "maintenance" &&
+    job.schedule.cadence !== "adaptive"
+  ) {
+    return new Date(job.schedule.cadence.anchorAt);
+  }
+  return new Date(job.createdAt);
 }
 
 function isEligible(job: CronJob, now: Date): boolean {
