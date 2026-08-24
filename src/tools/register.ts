@@ -34,26 +34,29 @@ export function registerCronTools(
   pi.registerTool({
     name: "cron_create",
     label: "Cron Create",
-    description: "Create one approved session-scoped cron job.",
+    description: "Create one session-scoped cron job.",
     promptSnippet:
       "Create a fixed, cron, one-shot, or adaptive scheduled prompt",
     promptGuidelines: [
-      "Use cron_create only when the user wants future or recurring work; creation requires interactive approval.",
+      "Use cron_create only when the user clearly wants future or recurring work; the tool executes immediately without confirmation.",
     ],
     parameters: CronCreateParams,
     async execute(_id, input, _signal, _update, ctx) {
       runtime.assertWritable?.();
       const draft = buildJobDraft(pi, ctx, creationFromTool(input));
-      const job = await runtime.requireService().create(draft);
+      const job = await runtime.requireService().create(draft, {
+        approvalMode: "automatic",
+      });
       return toolResult(`Created ${job.name} (${job.id})`, job);
     },
-    renderCall: (args, theme) =>
-      new Text(
-        theme.fg("toolTitle", `cron_create ${args.name ?? ""}`.trim()),
-        0,
-        0,
+    renderCall: (args, theme, context) =>
+      renderMutationCall(
+        `cron_create ${args.name ?? ""}`.trim(),
+        args,
+        context.expanded,
+        theme,
       ),
-    renderResult: renderCronResult,
+    renderResult: renderMutationResult,
   });
 
   pi.registerTool({
@@ -98,7 +101,7 @@ export function registerCronTools(
     promptSnippet:
       "Update one cron job by exact ID, name, or unambiguous prefix",
     promptGuidelines: [
-      "Use cron_update for configuration or state changes; privilege increases require approval.",
+      "Use cron_update for configuration or state changes; the tool executes immediately without confirmation.",
     ],
     parameters: CronUpdateParams,
     async execute(_id, input, _signal, _update, ctx) {
@@ -131,16 +134,23 @@ export function registerCronTools(
         if (Object.keys(patch).length === 0) {
           throw new Error("cron_update requires at least one field to change");
         }
-        job = await service.replace(current.id, patch);
+        job = await service.replace(current.id, patch, {
+          approvalMode: "automatic",
+        });
       }
       return toolResult(
         `Updated ${job.name}: ${describeSchedule(job.schedule)}`,
         job,
       );
     },
-    renderCall: (args, theme) =>
-      new Text(theme.fg("toolTitle", `cron_update ${args.selector}`), 0, 0),
-    renderResult: renderCronResult,
+    renderCall: (args, theme, context) =>
+      renderMutationCall(
+        `cron_update ${args.selector}`,
+        args,
+        context.expanded,
+        theme,
+      ),
+    renderResult: renderMutationResult,
   });
 
   pi.registerTool({
@@ -340,6 +350,29 @@ function toolResult(text: string, job: CronJob) {
     content: [{ type: "text" as const, text: `${text}\n${formatJob(job)}` }],
     details: { action: "job", job },
   };
+}
+
+function renderMutationCall(
+  title: string,
+  args: unknown,
+  expanded: boolean,
+  theme: { fg(color: string, value: string): string },
+): Text {
+  if (!expanded) return new Text(theme.fg("toolTitle", title), 0, 0);
+  const details = JSON.stringify(args, null, 2) ?? "";
+  const text = `${theme.fg("toolTitle", title)}\n${theme.fg("muted", details)}`;
+  return new Text(text, 0, 0);
+}
+
+function renderMutationResult(
+  result: { content: Array<{ type: string; text?: string }> },
+  options: { expanded: boolean },
+  theme: { fg(color: string, value: string): string },
+): Text {
+  const first = result.content[0];
+  const fullText = first?.type === "text" ? (first.text ?? "") : "";
+  const text = options.expanded ? fullText : (fullText.split("\n")[0] ?? "");
+  return new Text(theme.fg("muted", text), 0, 0);
 }
 
 function renderCronResult(

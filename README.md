@@ -136,7 +136,8 @@ Model names may be exact `provider/id` values or unique fuzzy matches. Unsupport
 
 ## Safety and limits
 
-- Creation and privilege-increasing edits require interactive approval.
+- LLM `cron_create` and `cron_update` calls apply immediately without prompting; their transcript rows remain collapsed until expanded with `Ctrl+O`.
+- Manual creation and privilege-increasing edits through `/cron` or the manager still require interactive approval.
 - Default expiry is seven days.
 - Three consecutive technical failures pause a job.
 - Normal recurring cadence is at least one minute.
@@ -148,7 +149,7 @@ Model names may be exact `provider/id` values or unique fuzzy matches. Unsupport
 - A per-session lease under Pi's agent directory prevents two Pi processes from scheduling the same session. The non-owner remains read-only.
 - Shutdown clears timers, aborts isolated work, checkpoints metrics, releases the lease, and clears footer state.
 
-Approval previews show the full prompt or maintenance source, schedule and exact next run, timezone, execution environment, resources, notification behavior, expiry/caps, timeout, failure limit, credentials warning, and configuration fingerprint.
+Manual approval previews show the full prompt or maintenance source, schedule and exact next run, timezone, execution environment, resources, notification behavior, expiry/caps, timeout, failure limit, credentials warning, and configuration fingerprint. Automatically accepted LLM mutations retain the approval timestamp and configuration fingerprint for auditing.
 
 ## Maintenance prompt
 

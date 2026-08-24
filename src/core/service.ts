@@ -6,6 +6,7 @@ import {
 import { assertCronEvent, reduceEvents } from "../domain/reducer.js";
 import { nextOccurrence } from "../domain/schedule.js";
 import {
+  type ApprovalMode,
   type ApprovalPort,
   type Clock,
   type CronEvent,
@@ -40,6 +41,10 @@ export interface JobDraft {
 }
 
 export type JobPatch = Partial<JobDraft>;
+
+export interface MutationOptions {
+  approvalMode?: ApprovalMode;
+}
 
 export interface ActiveExecution {
   readonly token: string;
@@ -106,7 +111,7 @@ export class CronService {
     this.onObserverError = options.onObserverError;
   }
 
-  create(draft: JobDraft): Promise<CronJob> {
+  create(draft: JobDraft, options: MutationOptions = {}): Promise<CronJob> {
     if (this.activeExecution) {
       return Promise.reject(
         new Error("Scheduled runs cannot create cron jobs"),
@@ -124,6 +129,7 @@ export class CronService {
       const approval = await this.approvals.approve(
         structuredClone(proposed),
         "create",
+        options.approvalMode ?? "interactive",
       );
       if (!approval) throw new Error("Cron job creation cancelled");
       this.validateCandidate(
@@ -146,7 +152,11 @@ export class CronService {
     });
   }
 
-  replace(selector: string, patch: JobPatch): Promise<CronJob> {
+  replace(
+    selector: string,
+    patch: JobPatch,
+    options: MutationOptions = {},
+  ): Promise<CronJob> {
     return this.enqueueMutation(async () => {
       const before = selectJob(this.jobs.values(), selector);
       const now = this.clock.now();
@@ -158,6 +168,7 @@ export class CronService {
         const approval = await this.approvals.approve(
           structuredClone(proposed),
           "privilege_increase",
+          options.approvalMode ?? "interactive",
         );
         if (!approval) throw new Error("Cron job replacement cancelled");
         this.validateCandidate(

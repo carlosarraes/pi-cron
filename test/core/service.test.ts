@@ -154,6 +154,19 @@ describe("CronService creation and validation", () => {
     service.endExecution(executionToken);
   });
 
+  it("forwards automatic approval mode when creating a job", async () => {
+    const approvals: ApprovalPort = {
+      approve: vi.fn(async (_job, _reason, mode) =>
+        mode === "automatic" ? APPROVAL : undefined,
+      ),
+    };
+    const { service } = makeService({ approvals });
+
+    await expect(
+      service.create(validDraft(), { approvalMode: "automatic" }),
+    ).resolves.toMatchObject({ approval: APPROVAL });
+  });
+
   it("creates an approved job with normalized defaults after durable append", async () => {
     let appendedAtNotification = 0;
     const store = new MemoryStore();
@@ -180,6 +193,7 @@ describe("CronService creation and validation", () => {
     expect(approvals.approve).toHaveBeenCalledWith(
       expect.objectContaining({ id: "deadbeef", name: "Report" }),
       "create",
+      "interactive",
     );
     expect(appendedAtNotification).toBe(1);
     expect(service.list()).toEqual([result]);
@@ -410,11 +424,33 @@ describe("CronService serialized definition mutations", () => {
     expect(approvals.approve).toHaveBeenCalledWith(
       expect.objectContaining({ maxRuns: 20 }),
       "privilege_increase",
+      "interactive",
     );
     expect(store.appended.map((event) => event.type)).toEqual([
       "job_replaced",
       "job_replaced",
     ]);
+  });
+
+  it("forwards automatic approval mode for privilege-increasing replacements", async () => {
+    const existing = storedJob({ maxRuns: 10 });
+    const approvals: ApprovalPort = {
+      approve: vi.fn(async (_job, _reason, mode) =>
+        mode === "automatic" ? APPROVAL : undefined,
+      ),
+    };
+    const { service } = makeService({
+      events: [created(existing)],
+      approvals,
+    });
+
+    await expect(
+      service.replace(
+        existing.id,
+        { maxRuns: 20 },
+        { approvalMode: "automatic" },
+      ),
+    ).resolves.toMatchObject({ maxRuns: 20, approval: APPROVAL });
   });
 
   it("requires unsafe authorization again when editing a sub-minute job", async () => {

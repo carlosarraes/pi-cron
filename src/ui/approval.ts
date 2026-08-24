@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describeSchedule, nextOccurrence } from "../domain/schedule.js";
 import {
+  type ApprovalMode,
   type ApprovalPort,
   type CronJob,
   DEFAULT_LIMITS,
@@ -17,7 +18,9 @@ export class UiApprovalPort implements ApprovalPort {
   async approve(
     job: ProposedJob,
     reason: "create" | "privilege_increase",
+    mode: ApprovalMode = "interactive",
   ): Promise<CronJob["approval"] | undefined> {
+    if (mode === "automatic") return this.recordApproval(job);
     if (!this.ctx.hasUI) {
       throw new Error("Cron mutation requires interactive approval");
     }
@@ -28,6 +31,10 @@ export class UiApprovalPort implements ApprovalPort {
       formatApproval(job, this.now()),
     );
     if (!accepted) return undefined;
+    return this.recordApproval(job);
+  }
+
+  private recordApproval(job: ProposedJob): CronJob["approval"] {
     return {
       approvedAt: this.now().toISOString(),
       fingerprint: fingerprintJob(job),

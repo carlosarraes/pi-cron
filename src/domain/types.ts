@@ -114,10 +114,13 @@ export interface EventStore {
   append(event: CronEvent): void;
 }
 
+export type ApprovalMode = "interactive" | "automatic";
+
 export interface ApprovalPort {
   approve(
     job: ProposedJob,
     reason: "create" | "privilege_increase",
+    mode: ApprovalMode,
   ): Promise<CronJob["approval"] | undefined>;
 }
 

@@ -244,7 +244,26 @@ describe("UiApprovalPort", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("rejects approval without interactive UI", async () => {
+  it("auto-approves without interactive UI or confirmation", async () => {
+    const confirm = vi.fn(async () => false);
+    const ctx = { hasUI: false, ui: { confirm } } as unknown as Pick<
+      ExtensionContext,
+      "hasUI" | "ui"
+    >;
+    await expect(
+      new UiApprovalPort(ctx, () => NOW).approve(
+        proposal(),
+        "create",
+        "automatic",
+      ),
+    ).resolves.toEqual({
+      approvedAt: NOW.toISOString(),
+      fingerprint: fingerprintJob(proposal()),
+    });
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it("rejects interactive approval without UI", async () => {
     const ctx = { hasUI: false, ui: {} } as unknown as Pick<
       ExtensionContext,
       "hasUI" | "ui"

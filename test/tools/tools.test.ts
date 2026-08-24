@@ -1,6 +1,7 @@
 import type {
   ExtensionAPI,
   ExtensionContext,
+  Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { describe, expect, it, vi } from "vitest";
@@ -19,6 +20,21 @@ import {
 
 const NOW = "2026-07-15T10:00:00.000Z";
 
+function fakeTheme(): Theme {
+  return {
+    fg: (_color: string, value: string) => value,
+    bold: (value: string) => value,
+  } as unknown as Theme;
+}
+
+interface ToolResult {
+  content: Array<{ type: string; text?: string }>;
+}
+
+interface RenderedComponent {
+  render(width: number): string[];
+}
+
 interface CapturedTool {
   name: string;
   promptSnippet?: string;
@@ -29,7 +45,17 @@ interface CapturedTool {
     signal: AbortSignal | undefined,
     update: unknown,
     ctx: ExtensionContext,
-  ): Promise<{ content: Array<{ type: string; text?: string }> }>;
+  ): Promise<ToolResult>;
+  renderCall?(
+    args: Record<string, unknown>,
+    theme: Theme,
+    context: { expanded: boolean },
+  ): RenderedComponent;
+  renderResult?(
+    result: ToolResult,
+    options: { expanded: boolean },
+    theme: Theme,
+  ): RenderedComponent;
 }
 
 function job(): CronJob {
@@ -97,7 +123,7 @@ async function execute(
   tool: CapturedTool | undefined,
   input: unknown,
   ctx: ExtensionContext,
-): Promise<{ content: Array<{ type: string; text?: string }> }> {
+): Promise<ToolResult> {
   if (!tool) throw new Error("tool not registered");
   return tool.execute("call", input, undefined, undefined, ctx);
 }
@@ -146,7 +172,102 @@ describe("registerCronTools", () => {
     expect(result.content[0].text).toContain("job-1");
   });
 
-  it("creates a strict draft and propagates approval cancellation", async () => {
+  it("requests automatic approval when creating from the LLM tool", async () => {
+    const { tools, service, ctx } = setup();
+
+    await execute(
+      tools.get("cron_create"),
+      { prompt: "check", every: "5m" },
+      ctx,
+    );
+
+    expect(service.create).toHaveBeenCalledWith(expect.any(Object), {
+      approvalMode: "automatic",
+    });
+  });
+
+  it("keeps create details collapsed until tool output is expanded", async () => {
+    const { tools, ctx } = setup();
+    const tool = tools.get("cron_create");
+    if (!tool?.renderCall || !tool.renderResult) {
+      throw new Error("cron_create renderers were not registered");
+    }
+    const args = { prompt: "check the build", every: "5m" };
+    const theme = fakeTheme();
+    const collapsedCall = tool
+      .renderCall(args, theme, { expanded: false })
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+    const expandedCall = tool
+      .renderCall(args, theme, { expanded: true })
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+    const result = await execute(tool, args, ctx);
+    const collapsedResult = tool
+      .renderResult(result, { expanded: false }, theme)
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+    const expandedResult = tool
+      .renderResult(result, { expanded: true }, theme)
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+
+    expect(collapsedCall).toBe("cron_create");
+    expect(expandedCall).toContain('"prompt": "check the build"');
+    expect(collapsedResult).toBe("Created Report (job-1)");
+    expect(collapsedResult).not.toContain("Prompt:");
+    expect(expandedResult).toContain("Schedule: every 1m");
+  });
+
+  it("keeps update details collapsed until tool output is expanded", async () => {
+    const { tools, ctx } = setup();
+    const tool = tools.get("cron_update");
+    if (!tool?.renderCall || !tool.renderResult) {
+      throw new Error("cron_update renderers were not registered");
+    }
+    const args = {
+      selector: "job-1",
+      prompt: "new instructions",
+      every: "2h",
+      maxRuns: 3,
+    };
+    const theme = fakeTheme();
+    const collapsedCall = tool
+      .renderCall(args, theme, { expanded: false })
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+    const expandedCall = tool
+      .renderCall(args, theme, { expanded: true })
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+    const result = await execute(tool, args, ctx);
+    const collapsedResult = tool
+      .renderResult(result, { expanded: false }, theme)
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+    const expandedResult = tool
+      .renderResult(result, { expanded: true }, theme)
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+
+    expect(collapsedCall).toBe("cron_update job-1");
+    expect(expandedCall).toContain('"prompt": "new instructions"');
+    expect(expandedCall).toContain('"every": "2h"');
+    expect(expandedCall).toContain('"maxRuns": 3');
+    expect(collapsedResult).toBe("Updated Report: every 1m");
+    expect(collapsedResult).not.toContain("Schedule:");
+    expect(expandedResult).toContain("Schedule: every 1m");
+  });
+
+  it("propagates creation failures", async () => {
     const cancelled = setup({
       create: vi.fn(async () => {
         throw new Error("Cron job creation cancelled");
@@ -196,6 +317,18 @@ describe("registerCronTools", () => {
       ctx,
     );
     expect(service.pause).toHaveBeenCalled();
+    await execute(
+      tools.get("cron_update"),
+      { selector: "job-1", every: "2h" },
+      ctx,
+    );
+    expect(service.replace).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Object),
+      {
+        approvalMode: "automatic",
+      },
+    );
     await execute(tools.get("cron_run"), { selector: "job-1" }, ctx);
     expect(runNow).toHaveBeenCalledWith("job-1");
     await execute(tools.get("cron_delete"), { selector: "job-1" }, ctx);
