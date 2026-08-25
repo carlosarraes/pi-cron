@@ -329,11 +329,23 @@ export function selectJobFromService(
 export function formatJobList(jobs: CronJob[]): string {
   if (jobs.length === 0) return "No cron jobs";
   return jobs
-    .map(
-      (job) =>
-        `${job.id}  ${job.state.padEnd(9)}  ${job.name}  ${describeSchedule(job.schedule)}`,
-    )
+    .map((job) => {
+      const last = job.lastTechnicalOutcome ?? "never";
+      const settled = job.lastSettledAt ?? "never";
+      return `${job.id}  ${job.state.padEnd(9)}  ${job.name}  ${describeSchedule(job.schedule)}  ${formatListExecution(job)}  runs=${job.runCount}  last=${last}  settled=${settled}`;
+    })
     .join("\n");
+}
+
+function formatListExecution(job: CronJob): string {
+  if (job.execution.kind === "main") {
+    return "exec=main  resources=inherited  notify=n/a";
+  }
+  const tools = job.execution.tools.join(",") || "none";
+  const skills = job.execution.skills.join(",") || "none";
+  const extensions = job.execution.extensions.join(",") || "none";
+  const notify = job.execution.notify ? "on" : "off";
+  return `exec=isolated  model=${job.execution.model}  effort=${job.execution.effort}  tools=${tools}  skills=${skills}  extensions=${extensions}  notify=${notify}  timeout=${job.execution.timeoutMs}ms`;
 }
 
 export function formatJob(job: CronJob): string {

@@ -130,13 +130,13 @@ It inherits the session's model, effort, tools, skills, extensions, project cont
   --timeout 20m
 ```
 
-Isolated mode uses a fresh in-memory `AgentSession`, pins the approved model and effort, and loads only approved tools, skills, and extensions. It does not wake the parent by default. Add `--notify` to send one parent follow-up when the run finishes.
+Isolated mode uses a fresh in-memory `AgentSession`, pins the approved model and effort, and loads only approved tools, skills, and extensions. Skills do not grant tools. LLM `cron_create` calls must provide `tools` explicitly for isolated jobs; use `tools: []` only for intentionally text-only work. It does not wake the parent by default. Add `--notify` to send one parent follow-up when the run finishes.
 
 Model names may be exact `provider/id` values or unique fuzzy matches. Unsupported effort levels and missing approved resources fail safely.
 
 ## Safety and limits
 
-- LLM `cron_create` and `cron_update` calls apply immediately without prompting; their transcript rows remain collapsed until expanded with `Ctrl+O`.
+- LLM `cron_create` and `cron_update` calls apply immediately without prompting. Their collapsed transcript rows still show schedule, execution mode, tools, and notification behavior; `Ctrl+O` reveals the full prompt and arguments.
 - Manual creation and privilege-increasing edits through `/cron` or the manager still require interactive approval.
 - Default expiry is seven days.
 - Three consecutive technical failures pause a job.
@@ -190,7 +190,7 @@ Text commands work in every mode:
 /cron stop --all
 ```
 
-Selectors accept an exact ID, exact case-insensitive name, or an unambiguous ID/name prefix.
+Selectors accept an exact ID, exact case-insensitive name, or an unambiguous ID/name prefix. List output includes execution mode/resources, run count, last technical outcome, and last settlement time so a triggered job is observable without reading session storage.
 
 The agent-facing tools are `cron_create`, `cron_list`, `cron_update`, `cron_delete`, `cron_run`, and `cron_wakeup`.
 

@@ -34,11 +34,13 @@ export function registerCronTools(
   pi.registerTool({
     name: "cron_create",
     label: "Cron Create",
-    description: "Create one session-scoped cron job.",
+    description:
+      "Create one session-scoped cron job. Main mode is the default; isolated mode requires an explicit tools list.",
     promptSnippet:
       "Create a fixed, cron, one-shot, or adaptive scheduled prompt",
     promptGuidelines: [
       "Use cron_create only when the user clearly wants future or recurring work; the tool executes immediately without confirmation.",
+      "Prefer main mode for cron_create unless the user explicitly requests isolation. Isolated jobs require an explicit tools list; skills do not grant tools. Use tools=[] only for text-only jobs.",
     ],
     parameters: CronCreateParams,
     async execute(_id, input, _signal, _update, ctx) {
@@ -53,6 +55,7 @@ export function registerCronTools(
       renderMutationCall(
         `cron_create ${args.name ?? ""}`.trim(),
         args,
+        "create",
         context.expanded,
         theme,
       ),
@@ -66,7 +69,7 @@ export function registerCronTools(
     promptSnippet:
       "List active, paused, missed, completed, and expired cron jobs",
     promptGuidelines: [
-      "Use cron_list before updating or deleting a job when its exact ID is unknown.",
+      "Use cron_list before updating or deleting a job when its exact ID is unknown, and to verify run count, last outcome, execution mode, tools, and notification behavior.",
     ],
     parameters: CronListParams,
     async execute() {
@@ -102,12 +105,14 @@ export function registerCronTools(
       "Update one cron job by exact ID, name, or unambiguous prefix",
     promptGuidelines: [
       "Use cron_update for configuration or state changes; the tool executes immediately without confirmation.",
+      "When cron_update changes a main job to isolated mode, provide its complete tools list explicitly; skills do not grant tools.",
     ],
     parameters: CronUpdateParams,
     async execute(_id, input, _signal, _update, ctx) {
       runtime.assertWritable?.();
       const service = runtime.requireService();
-      const editable = patchFromTool(input);
+      const current = selectJobFromService(service, input.selector);
+      const editable = patchFromTool(input, current);
       if (input.timezone !== undefined && !hasSchedule(input)) {
         throw new Error("cron_update timezone requires a cron schedule change");
       }
@@ -122,7 +127,6 @@ export function registerCronTools(
       } else if (input.state === "active") {
         job = await service.resume(input.selector);
       } else {
-        const current = selectJobFromService(service, input.selector);
         const patch = buildJobPatch(
           pi,
           ctx,
@@ -138,15 +142,13 @@ export function registerCronTools(
           approvalMode: "automatic",
         });
       }
-      return toolResult(
-        `Updated ${job.name}: ${describeSchedule(job.schedule)}`,
-        job,
-      );
+      return toolResult(`Updated ${job.name} (${job.id})`, job);
     },
     renderCall: (args, theme, context) =>
       renderMutationCall(
         `cron_update ${args.selector}`,
         args,
+        "update",
         context.expanded,
         theme,
       ),
@@ -243,7 +245,10 @@ function creationFromTool(input: CronCreateInput): CreationFields {
   };
 }
 
-function patchFromTool(input: CronUpdateInput): EditableDraft {
+function patchFromTool(
+  input: CronUpdateInput,
+  current: CronJob,
+): EditableDraft {
   const patch: EditableDraft = {};
   if (input.name !== undefined) patch.name = input.name;
   if (input.prompt !== undefined) patch.prompt = input.prompt;
@@ -257,7 +262,13 @@ function patchFromTool(input: CronUpdateInput): EditableDraft {
     input.tools !== undefined ||
     input.skills !== undefined ||
     input.extensions !== undefined;
-  if (hasExecution) patch.execution = executionFromTool(input, true);
+  if (hasExecution) {
+    patch.execution = executionFromTool(
+      input,
+      true,
+      current.execution.kind === "isolated",
+    );
+  }
   if (input.expires !== undefined) patch.expires = input.expires;
   if (input.maxRuns !== undefined) patch.maxRuns = input.maxRuns;
   if (input.tokenBudget !== undefined) patch.tokenBudget = input.tokenBudget;
@@ -317,6 +328,7 @@ function executionFromTool(
     extensions?: string[];
   },
   update = false,
+  hasIsolatedBaseline = false,
 ): ExecutionDraft {
   const isolated =
     input.mode === "isolated" ||
@@ -331,6 +343,11 @@ function executionFromTool(
   if (input.mode === "main") {
     throw new Error(
       "Isolated model, effort, notify, timeout, and resources require mode=isolated",
+    );
+  }
+  if (input.tools === undefined && !hasIsolatedBaseline) {
+    throw new Error(
+      "Isolated cron jobs require explicit tools; pass tools=[...] or tools=[] for a text-only job",
     );
   }
   return {
@@ -352,27 +369,112 @@ function toolResult(text: string, job: CronJob) {
   };
 }
 
+type MutationInput = Partial<CronCreateInput & CronUpdateInput>;
+
 function renderMutationCall(
   title: string,
-  args: unknown,
+  args: MutationInput,
+  kind: "create" | "update",
   expanded: boolean,
   theme: { fg(color: string, value: string): string },
 ): Text {
-  if (!expanded) return new Text(theme.fg("toolTitle", title), 0, 0);
+  const compact = `${title} · ${formatMutationInput(args, kind)}`;
+  if (!expanded) return new Text(theme.fg("toolTitle", compact), 0, 0);
   const details = JSON.stringify(args, null, 2) ?? "";
-  const text = `${theme.fg("toolTitle", title)}\n${theme.fg("muted", details)}`;
+  const text = `${theme.fg("toolTitle", compact)}\n${theme.fg("muted", details)}`;
   return new Text(text, 0, 0);
 }
 
+function formatMutationInput(
+  input: MutationInput,
+  kind: "create" | "update",
+): string {
+  const parts = [formatInputSchedule(input, kind)];
+  const changesExecution =
+    input.mode !== undefined ||
+    input.model !== undefined ||
+    input.effort !== undefined ||
+    input.notify !== undefined ||
+    input.timeout !== undefined ||
+    input.tools !== undefined ||
+    input.skills !== undefined ||
+    input.extensions !== undefined;
+  if (kind === "update" && !changesExecution) {
+    parts.push("mode unchanged", "tools unchanged", "notify unchanged");
+    return parts.join(" · ");
+  }
+
+  const isolated =
+    input.mode === "isolated" ||
+    input.model !== undefined ||
+    input.effort !== undefined ||
+    (kind === "update" ? input.notify !== undefined : input.notify === true) ||
+    input.timeout !== undefined ||
+    input.tools !== undefined ||
+    input.skills !== undefined ||
+    input.extensions !== undefined;
+  parts.push(isolated ? "isolated" : "main");
+  if (!isolated) {
+    parts.push("tools inherited", "notify n/a");
+  } else {
+    let tools = "tools unchanged";
+    if (input.tools !== undefined) {
+      tools = `tools ${input.tools.join(",") || "none"}`;
+    } else if (kind === "create") {
+      tools = "tools omitted";
+    }
+    parts.push(tools);
+
+    const keepsNotify = input.notify === undefined && kind === "update";
+    const notify = keepsNotify
+      ? "notify unchanged"
+      : `notify ${input.notify === true ? "on" : "off"}`;
+    parts.push(notify);
+  }
+  return parts.join(" · ");
+}
+
+function formatInputSchedule(
+  input: MutationInput,
+  kind: "create" | "update",
+): string {
+  if (input.every !== undefined) return `every ${input.every}`;
+  if (input.cron !== undefined) return `cron ${input.cron}`;
+  if (input.in !== undefined) return `in ${input.in}`;
+  if (input.at !== undefined) return `at ${input.at}`;
+  if (input.adaptive === true) return "adaptive";
+  return kind === "create" ? "schedule missing" : "schedule unchanged";
+}
+
 function renderMutationResult(
-  result: { content: Array<{ type: string; text?: string }> },
+  result: {
+    content: Array<{ type: string; text?: string }>;
+    details?: { job?: CronJob };
+  },
   options: { expanded: boolean },
   theme: { fg(color: string, value: string): string },
 ): Text {
   const first = result.content[0];
   const fullText = first?.type === "text" ? (first.text ?? "") : "";
-  const text = options.expanded ? fullText : (fullText.split("\n")[0] ?? "");
+  if (options.expanded) return new Text(theme.fg("muted", fullText), 0, 0);
+
+  const firstLine = fullText.split("\n")[0] ?? "";
+  const job = result.details?.job;
+  const text = job
+    ? `${firstLine} · ${formatJobConfiguration(job)}`
+    : firstLine;
   return new Text(theme.fg("muted", text), 0, 0);
+}
+
+function formatJobConfiguration(job: CronJob): string {
+  const parts = [describeSchedule(job.schedule), job.execution.kind];
+  if (job.execution.kind === "main") {
+    parts.push("tools inherited", "notify n/a");
+  } else {
+    parts.push(`tools ${job.execution.tools.join(",") || "none"}`);
+    parts.push(`notify ${job.execution.notify ? "on" : "off"}`);
+  }
+  return parts.join(" · ");
 }
 
 function renderCronResult(

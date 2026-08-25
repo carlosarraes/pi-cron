@@ -29,6 +29,7 @@ function fakeTheme(): Theme {
 
 interface ToolResult {
   content: Array<{ type: string; text?: string }>;
+  details?: unknown;
 }
 
 interface RenderedComponent {
@@ -164,12 +165,56 @@ describe("registerCronTools", () => {
       expect(tool.promptSnippet).toBeTruthy();
       expect(tool.promptGuidelines?.length).toBeGreaterThan(0);
     }
+    expect(tools.get("cron_create")?.promptGuidelines?.join(" ")).toContain(
+      "Prefer main mode",
+    );
+    expect(tools.get("cron_create")?.promptGuidelines?.join(" ")).toContain(
+      "skills do not grant tools",
+    );
   });
 
-  it("lists jobs without requiring UI", async () => {
-    const { tools, ctx } = setup();
+  it("lists run history needed to confirm whether a job triggered", async () => {
+    const current = job();
+    current.runCount = 4;
+    current.lastTechnicalOutcome = "settled";
+    current.lastSettledAt = NOW;
+    current.execution = {
+      kind: "isolated",
+      model: "openai/model-a",
+      effort: "medium",
+      tools: [],
+      skills: ["pr-sweep"],
+      extensions: [],
+      notify: false,
+      timeoutMs: 30 * 60_000,
+    };
+    const { tools, ctx } = setup({
+      list: vi.fn(() => [current]),
+    });
+
     const result = await execute(tools.get("cron_list"), {}, ctx);
+
     expect(result.content[0].text).toContain("job-1");
+    expect(result.content[0].text).toContain("runs=4");
+    expect(result.content[0].text).toContain("last=settled");
+    expect(result.content[0].text).toContain(`settled=${NOW}`);
+    expect(result.content[0].text).toContain("exec=isolated");
+    expect(result.content[0].text).toContain("tools=none");
+    expect(result.content[0].text).toContain("notify=off");
+    expect(result.content[0].text).toContain("model=openai/model-a");
+    expect(result.content[0].text).toContain("effort=medium");
+    expect(result.content[0].text).toContain("skills=pr-sweep");
+    expect(result.content[0].text).toContain("extensions=none");
+    expect(result.content[0].text).toContain("timeout=1800000ms");
+  });
+
+  it("lists never for jobs that have not settled", async () => {
+    const { tools, ctx } = setup();
+
+    const result = await execute(tools.get("cron_list"), {}, ctx);
+
+    expect(result.content[0].text).toContain("last=never");
+    expect(result.content[0].text).toContain("settled=never");
   });
 
   it("requests automatic approval when creating from the LLM tool", async () => {
@@ -186,54 +231,127 @@ describe("registerCronTools", () => {
     });
   });
 
-  it("keeps create details collapsed until tool output is expanded", async () => {
-    const { tools, ctx } = setup();
+  it("rejects the tool-less isolated configuration from the failed Mac job", async () => {
+    const { tools, service, ctx } = setup();
+
+    await expect(
+      execute(
+        tools.get("cron_create"),
+        {
+          name: "pr-sweep",
+          prompt: "run the sweep",
+          every: "10m",
+          mode: "isolated",
+          timeout: "30m",
+          skills: ["pr-sweep"],
+          notify: false,
+        },
+        ctx,
+      ),
+    ).rejects.toThrow("require explicit tools");
+    expect(service.create).not.toHaveBeenCalled();
+  });
+
+  it("allows explicit empty tools for an isolated text-only job", async () => {
+    const { tools, service, ctx } = setup();
+
+    await execute(
+      tools.get("cron_create"),
+      {
+        prompt: "write a greeting without using tools",
+        every: "10m",
+        mode: "isolated",
+        tools: [],
+      },
+      ctx,
+    );
+
+    expect(service.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        execution: expect.objectContaining({ kind: "isolated", tools: [] }),
+      }),
+      { approvalMode: "automatic" },
+    );
+  });
+
+  it("rejects converting a main job to isolated without explicit tools", async () => {
+    const { tools, service, ctx } = setup();
+
+    await expect(
+      execute(
+        tools.get("cron_update"),
+        {
+          selector: "job-1",
+          mode: "isolated",
+          skills: ["pr-sweep"],
+        },
+        ctx,
+      ),
+    ).rejects.toThrow("require explicit tools");
+    expect(service.replace).not.toHaveBeenCalled();
+  });
+
+  it("retains tools when updating an existing isolated job", async () => {
+    const isolated = job();
+    isolated.execution = {
+      kind: "isolated",
+      model: "openai/model-a",
+      effort: "medium",
+      tools: ["read", "bash"],
+      skills: ["pr-sweep"],
+      extensions: [],
+      notify: false,
+      timeoutMs: 30 * 60_000,
+    };
+    const { tools, service, ctx } = setup({
+      list: vi.fn(() => [isolated]),
+      get: vi.fn(() => isolated),
+    });
+
+    await execute(
+      tools.get("cron_update"),
+      { selector: "job-1", notify: true },
+      ctx,
+    );
+
+    expect(service.replace).toHaveBeenCalledWith(
+      "job-1",
+      expect.objectContaining({
+        execution: expect.objectContaining({
+          kind: "isolated",
+          tools: ["read", "bash"],
+          notify: true,
+        }),
+      }),
+      { approvalMode: "automatic" },
+    );
+  });
+
+  it("shows create configuration while keeping the prompt collapsed", async () => {
+    const isolated = job();
+    isolated.execution = {
+      kind: "isolated",
+      model: "openai/model-a",
+      effort: "medium",
+      tools: ["read", "bash"],
+      skills: ["pr-sweep"],
+      extensions: [],
+      notify: false,
+      timeoutMs: 30 * 60_000,
+    };
+    const { tools, ctx } = setup({
+      create: vi.fn(async () => isolated),
+    });
     const tool = tools.get("cron_create");
     if (!tool?.renderCall || !tool.renderResult) {
       throw new Error("cron_create renderers were not registered");
     }
-    const args = { prompt: "check the build", every: "5m" };
-    const theme = fakeTheme();
-    const collapsedCall = tool
-      .renderCall(args, theme, { expanded: false })
-      .render(1_000)
-      .join("\n")
-      .trimEnd();
-    const expandedCall = tool
-      .renderCall(args, theme, { expanded: true })
-      .render(1_000)
-      .join("\n")
-      .trimEnd();
-    const result = await execute(tool, args, ctx);
-    const collapsedResult = tool
-      .renderResult(result, { expanded: false }, theme)
-      .render(1_000)
-      .join("\n")
-      .trimEnd();
-    const expandedResult = tool
-      .renderResult(result, { expanded: true }, theme)
-      .render(1_000)
-      .join("\n")
-      .trimEnd();
-
-    expect(collapsedCall).toBe("cron_create");
-    expect(expandedCall).toContain('"prompt": "check the build"');
-    expect(collapsedResult).toBe("Created Report (job-1)");
-    expect(collapsedResult).not.toContain("Prompt:");
-    expect(expandedResult).toContain("Schedule: every 1m");
-  });
-
-  it("keeps update details collapsed until tool output is expanded", async () => {
-    const { tools, ctx } = setup();
-    const tool = tools.get("cron_update");
-    if (!tool?.renderCall || !tool.renderResult) {
-      throw new Error("cron_update renderers were not registered");
-    }
     const args = {
-      selector: "job-1",
-      prompt: "new instructions",
-      every: "2h",
-      maxRuns: 3,
+      prompt: "check the build",
+      every: "5m",
+      mode: "isolated",
+      tools: ["read", "bash"],
+      notify: false,
     };
     const theme = fakeTheme();
     const collapsedCall = tool
@@ -258,12 +376,114 @@ describe("registerCronTools", () => {
       .join("\n")
       .trimEnd();
 
-    expect(collapsedCall).toBe("cron_update job-1");
+    expect(collapsedCall).toBe(
+      "cron_create · every 5m · isolated · tools read,bash · notify off",
+    );
+    expect(collapsedCall).not.toContain("check the build");
+    expect(expandedCall).toContain('"prompt": "check the build"');
+    expect(collapsedResult).toBe(
+      "Created Report (job-1) · every 1m · isolated · tools read,bash · notify off",
+    );
+    expect(expandedResult).toContain("Schedule: every 1m");
+  });
+
+  it("shows inherited main-session resources without exposing the prompt", async () => {
+    const { tools, ctx } = setup();
+    const tool = tools.get("cron_create");
+    if (!tool?.renderCall || !tool.renderResult) {
+      throw new Error("cron_create renderers were not registered");
+    }
+    const args = { prompt: "check the build", every: "5m" };
+    const theme = fakeTheme();
+    const collapsedCall = tool
+      .renderCall(args, theme, { expanded: false })
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+    const result = await execute(tool, args, ctx);
+    const collapsedResult = tool
+      .renderResult(result, { expanded: false }, theme)
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+
+    expect(collapsedCall).toBe(
+      "cron_create · every 5m · main · tools inherited · notify n/a",
+    );
+    expect(collapsedCall).not.toContain("check the build");
+    expect(collapsedResult).toBe(
+      "Created Report (job-1) · every 1m · main · tools inherited · notify n/a",
+    );
+  });
+
+  it("shows unchanged execution fields on schedule-only updates", async () => {
+    const { tools } = setup();
+    const tool = tools.get("cron_update");
+    if (!tool?.renderCall) {
+      throw new Error("cron_update renderer was not registered");
+    }
+
+    const collapsedCall = tool
+      .renderCall({ selector: "job-1", every: "2h" }, fakeTheme(), {
+        expanded: false,
+      })
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+
+    expect(collapsedCall).toBe(
+      "cron_update job-1 · every 2h · mode unchanged · tools unchanged · notify unchanged",
+    );
+  });
+
+  it("shows update configuration while keeping the prompt collapsed", async () => {
+    const { tools, ctx } = setup();
+    const tool = tools.get("cron_update");
+    if (!tool?.renderCall || !tool.renderResult) {
+      throw new Error("cron_update renderers were not registered");
+    }
+    const args = {
+      selector: "job-1",
+      prompt: "new instructions",
+      every: "2h",
+      maxRuns: 3,
+      mode: "isolated" as const,
+      tools: ["read", "bash"],
+      notify: true,
+    };
+    const theme = fakeTheme();
+    const collapsedCall = tool
+      .renderCall(args, theme, { expanded: false })
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+    const expandedCall = tool
+      .renderCall(args, theme, { expanded: true })
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+    const result = await execute(tool, args, ctx);
+    const collapsedResult = tool
+      .renderResult(result, { expanded: false }, theme)
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+    const expandedResult = tool
+      .renderResult(result, { expanded: true }, theme)
+      .render(1_000)
+      .join("\n")
+      .trimEnd();
+
+    expect(collapsedCall).toBe(
+      "cron_update job-1 · every 2h · isolated · tools read,bash · notify on",
+    );
+    expect(collapsedCall).not.toContain("new instructions");
     expect(expandedCall).toContain('"prompt": "new instructions"');
     expect(expandedCall).toContain('"every": "2h"');
     expect(expandedCall).toContain('"maxRuns": 3');
-    expect(collapsedResult).toBe("Updated Report: every 1m");
-    expect(collapsedResult).not.toContain("Schedule:");
+    expect(collapsedResult).toBe(
+      "Updated Report (job-1) · every 1m · main · tools inherited · notify n/a",
+    );
     expect(expandedResult).toContain("Schedule: every 1m");
   });
 
