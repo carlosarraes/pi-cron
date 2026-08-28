@@ -51,6 +51,7 @@ class FakeService implements SchedulerService {
     [];
   flushes = 0;
   shouldFlush = false;
+  onSkip?: () => void;
 
   constructor(jobs: CronJob[]) {
     for (const current of jobs) this.jobs.set(current.id, current);
@@ -71,6 +72,17 @@ class FakeService implements SchedulerService {
     if (current && result.outcome !== "dispatched") {
       this.jobs.set(id, { ...current, runCount: current.runCount + 1 });
     }
+  }
+
+  async recordSkip(id: string, at: Date): Promise<void> {
+    const current = this.jobs.get(id);
+    if (!current) return;
+    this.jobs.set(id, {
+      ...current,
+      skippedRuns: (current.skippedRuns ?? 0) + 1,
+      lastSkippedAt: at.toISOString(),
+    });
+    this.onSkip?.();
   }
 
   shouldFlushCheckpoint(): boolean {
@@ -411,6 +423,102 @@ describe("Scheduler", () => {
     expect(dispatcher.calls.map((call) => call.at.toISOString())).toEqual([
       "2026-07-15T10:01:00.000Z",
       "2026-07-15T10:02:00.000Z",
+    ]);
+  });
+
+  it("skips due occurrences while the same skip-policy job is running", async () => {
+    const { scheduler, clock, dispatcher, service } = harness([
+      job("slow", 60_000, { overlap: "skip" }),
+    ]);
+    const gate = deferred<DispatchResult>();
+    let calls = 0;
+    dispatcher.executeImpl = async () => {
+      calls += 1;
+      return calls === 1 ? gate.promise : { outcome: "settled", tokens: 0 };
+    };
+    scheduler.start();
+
+    clock.advanceBy(60_000);
+    await settleAsync();
+    clock.advanceBy(60_000);
+    await settleAsync();
+
+    expect(dispatcher.calls.map((call) => call.at.toISOString())).toEqual([
+      "2026-07-15T10:01:00.000Z",
+    ]);
+    expect(service.jobs.get("slow")).toMatchObject({
+      skippedRuns: 1,
+      lastSkippedAt: "2026-07-15T10:02:00.000Z",
+    });
+
+    gate.resolve({ outcome: "settled", tokens: 0 });
+    await settleAsync();
+    clock.advanceBy(60_000);
+    await settleAsync();
+
+    expect(dispatcher.calls.map((call) => call.at.toISOString())).toEqual([
+      "2026-07-15T10:01:00.000Z",
+      "2026-07-15T10:03:00.000Z",
+    ]);
+  });
+
+  it("preserves simultaneous ticks when recording a skip refreshes the scheduler", async () => {
+    const { scheduler, clock, dispatcher, service } = harness([
+      job("a-running", 60_000, { overlap: "skip" }),
+      job("b-due", 120_000),
+    ]);
+    const gate = deferred<DispatchResult>();
+    dispatcher.executeImpl = async () => gate.promise;
+    service.onSkip = () => scheduler.refresh();
+    scheduler.start();
+
+    clock.advanceBy(60_000);
+    await settleAsync();
+    clock.advanceBy(60_000);
+    await settleAsync();
+
+    expect(service.jobs.get("a-running")?.skippedRuns).toBe(1);
+    expect(scheduler.getRuntimeStatus("b-due")).toEqual({
+      state: "pending",
+      pendingSince: "2026-07-15T10:02:00.000Z",
+    });
+
+    gate.resolve({ outcome: "settled", tokens: 0 });
+    await settleAsync();
+  });
+
+  it("keeps a skip-policy job pending when a different job is running", async () => {
+    const { scheduler, clock, dispatcher, service } = harness([
+      job("a-running", 60_000),
+      job("b-waiting", 120_000, { overlap: "skip" }),
+    ]);
+    const gate = deferred<DispatchResult>();
+    let calls = 0;
+    dispatcher.executeImpl = async () => {
+      calls += 1;
+      return calls === 1 ? gate.promise : { outcome: "settled", tokens: 0 };
+    };
+    scheduler.start();
+
+    clock.advanceBy(60_000);
+    await settleAsync();
+    clock.advanceBy(60_000);
+    await settleAsync();
+
+    expect(scheduler.getRuntimeStatus("b-waiting")).toEqual({
+      state: "pending",
+      pendingSince: "2026-07-15T10:02:00.000Z",
+    });
+    expect(service.jobs.get("b-waiting")?.skippedRuns).toBeUndefined();
+
+    const running = service.jobs.get("a-running");
+    if (running) service.jobs.set(running.id, { ...running, state: "paused" });
+    gate.resolve({ outcome: "settled", tokens: 0 });
+    await settleAsync();
+
+    expect(dispatcher.calls.map((call) => call.jobId)).toEqual([
+      "a-running",
+      "b-waiting",
     ]);
   });
 

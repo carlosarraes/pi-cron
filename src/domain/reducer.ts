@@ -182,6 +182,7 @@ export function isCronJob(value: unknown): value is CronJob {
       "schedule",
       "state",
       "execution",
+      "overlap",
       "createdAt",
       "updatedAt",
       "expiresAt",
@@ -190,6 +191,8 @@ export function isCronJob(value: unknown): value is CronJob {
       "runCount",
       "attributedTokens",
       "consecutiveFailures",
+      "skippedRuns",
+      "lastSkippedAt",
       "lastOccurrenceAt",
       "lastDispatchAt",
       "lastSettledAt",
@@ -207,6 +210,11 @@ export function isCronJob(value: unknown): value is CronJob {
       value.state as string,
     ) &&
     isExecution(value.execution) &&
+    hasOptionalField(
+      value,
+      "overlap",
+      (field) => field === "queue" || field === "skip",
+    ) &&
     isString(value.createdAt) &&
     isString(value.updatedAt) &&
     isString(value.expiresAt) &&
@@ -215,6 +223,8 @@ export function isCronJob(value: unknown): value is CronJob {
     isCounter(value.runCount) &&
     isCounter(value.attributedTokens) &&
     isCounter(value.consecutiveFailures) &&
+    hasOptionalField(value, "skippedRuns", isCounter) &&
+    hasOptionalField(value, "lastSkippedAt", isString) &&
     hasOptionalField(value, "lastOccurrenceAt", isString) &&
     hasOptionalField(value, "lastDispatchAt", isString) &&
     hasOptionalField(value, "lastSettledAt", isString) &&
@@ -234,6 +244,8 @@ function isMetrics(value: unknown): value is JobMetrics {
       "runCount",
       "attributedTokens",
       "consecutiveFailures",
+      "skippedRuns",
+      "lastSkippedAt",
       "lastOccurrenceAt",
       "lastDispatchAt",
       "lastSettledAt",
@@ -243,6 +255,8 @@ function isMetrics(value: unknown): value is JobMetrics {
     isCounter(value.runCount) &&
     isCounter(value.attributedTokens) &&
     isCounter(value.consecutiveFailures) &&
+    hasOptionalField(value, "skippedRuns", isCounter) &&
+    hasOptionalField(value, "lastSkippedAt", isString) &&
     hasOptionalField(value, "lastOccurrenceAt", isString) &&
     hasOptionalField(value, "lastDispatchAt", isString) &&
     hasOptionalField(value, "lastSettledAt", isString) &&
@@ -319,6 +333,12 @@ export function reduceEvents(events: CronEvent[]): Map<string, CronJob> {
           attributedTokens: metrics.attributedTokens,
           consecutiveFailures: metrics.consecutiveFailures,
         };
+        if (metrics.skippedRuns !== undefined) {
+          updated.skippedRuns = metrics.skippedRuns;
+        }
+        if (metrics.lastSkippedAt !== undefined) {
+          updated.lastSkippedAt = metrics.lastSkippedAt;
+        }
         if (metrics.lastOccurrenceAt !== undefined) {
           updated.lastOccurrenceAt = metrics.lastOccurrenceAt;
         }

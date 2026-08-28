@@ -54,7 +54,7 @@ describe("parseCronCommand", () => {
   it("parses every strict create field", () => {
     expect(
       parseCronCommand(
-        'add --every 5m --prompt "check CI" --name nightly --isolated sonnet --effort high --notify --expires 2d --max-runs 5 --budget 2000 --timeout 10m --tools read,bash --skills "review, test" --extensions github,slack',
+        'add --every 5m --prompt "check CI" --name nightly --overlap skip --isolated sonnet --effort high --notify --expires 2d --max-runs 5 --budget 2000 --timeout 10m --tools read,bash --skills "review, test" --extensions github,slack',
       ),
     ).toEqual({
       kind: "create",
@@ -62,6 +62,7 @@ describe("parseCronCommand", () => {
         schedule: { kind: "interval", value: "5m" },
         prompt: "check CI",
         name: "nightly",
+        overlap: "skip",
         execution: {
           kind: "isolated",
           model: "sonnet",
@@ -193,6 +194,7 @@ describe("parseCronCommand", () => {
       `add --every 30s --unsafe-seconds --max-runs ${"9".repeat(400)} --prompt work`,
       /positive integer/,
     ],
+    ["add --adaptive --prompt work --overlap later", /Invalid --overlap/],
     ["add --adaptive --prompt work --unknown value", /Unknown flag/],
     ["add --adaptive --prompt one --prompt two", /Duplicate flag/],
     ["add --adaptive --prompt", /requires a value/],

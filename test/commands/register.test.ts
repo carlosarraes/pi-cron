@@ -119,7 +119,7 @@ describe("registerCronCommand", () => {
 
   it("creates strict and shorthand jobs through the shared service", async () => {
     const { run, service } = setup();
-    await run('add --every 5m --prompt "check CI" --main');
+    await run('add --every 5m --prompt "check CI" --overlap skip --main');
     expect(service.create).toHaveBeenCalledWith(
       expect.objectContaining({
         prompt: { kind: "text", text: "check CI" },
@@ -128,6 +128,7 @@ describe("registerCronCommand", () => {
           intervalMs: 300_000,
         }),
         execution: { kind: "main" },
+        overlap: "skip",
       }),
     );
 

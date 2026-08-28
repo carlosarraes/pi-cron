@@ -30,6 +30,7 @@ function proposal(): ProposedJob {
       timezone: "UTC",
     },
     state: "active",
+    overlap: "skip",
     execution: {
       kind: "isolated",
       model: "openai/model-a",
@@ -90,13 +91,13 @@ function wizardContext(options: {
 }
 
 describe("wizard reducer", () => {
-  it("advances through the five named steps in order", () => {
+  it("advances through the six named steps in order", () => {
     let state = initialWizardState({
       schedule: { kind: "adaptive" },
       prompt: "work",
     });
     const steps = [state.step];
-    for (let index = 0; index < 4; index += 1) {
+    for (let index = 0; index < 5; index += 1) {
       state = reduceWizard(state, { type: "next" });
       steps.push(state.step);
     }
@@ -104,6 +105,7 @@ describe("wizard reducer", () => {
       "schedule",
       "prompt",
       "execution",
+      "overlap",
       "limits",
       "review",
     ]);
@@ -143,6 +145,7 @@ describe("runCronWizard", () => {
         "Every 5m",
         "Continue",
         "Main session — inherits model + effort at fire time",
+        "Skip ticks while this job is running",
         "Use defaults (7d expiry, 3-failure pause)",
         "Continue to approval",
       ],
@@ -157,13 +160,15 @@ describe("runCronWizard", () => {
       prompt: { kind: "text", text: "preserve\nmultiline" },
       schedule: { kind: "interval", intervalMs: 300_000 },
       execution: { kind: "main" },
+      overlap: "skip",
     });
     expect(titles).toEqual(
       expect.arrayContaining([
-        "1/5 Schedule",
-        "2/5 Prompt",
-        "3/5 Execution",
-        "4/5 Limits",
+        "1/6 Schedule",
+        "2/6 Prompt",
+        "3/6 Execution",
+        "4/6 Overlap",
+        "5/6 Limits",
         expect.stringContaining("next 2026-07-15T10:05:00.000Z"),
       ]),
     );
@@ -177,6 +182,7 @@ describe("runCronWizard", () => {
         "Isolated",
         "openai/model-a",
         "high",
+        "Queue one missed run (default)",
         "Use defaults (7d expiry, 3-failure pause)",
         "Continue to approval",
       ],
@@ -219,12 +225,16 @@ describe("UiApprovalPort", () => {
     expect(text).toContain("Full multiline\nprompt");
     expect(text).toContain("Next run: 2026-07-16T09:00:00.000Z");
     expect(text).toContain("Timezone: UTC");
+    expect(text).toContain("Overlap: skip");
     expect(text).toContain("Model: openai/model-a");
     expect(text).toContain("Tools: read");
     expect(text).toContain("Notify parent: yes");
     expect(text).toContain("Credentials warning");
     expect(text).toContain(fingerprintJob(proposal()));
     expect(fingerprintJob(proposal())).toHaveLength(64);
+    expect(fingerprintJob({ ...proposal(), overlap: "queue" })).not.toBe(
+      fingerprintJob(proposal()),
+    );
   });
 
   it("returns approval on confirmation and undefined on cancellation", async () => {

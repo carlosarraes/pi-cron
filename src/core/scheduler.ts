@@ -17,6 +17,7 @@ export interface SchedulerService {
     result: DispatchResult,
     scheduledAt: Date,
   ): Promise<void>;
+  recordSkip(jobId: string, scheduledAt: Date): Promise<void>;
   shouldFlushCheckpoint(policy: { maxRuns: number; maxAgeMs: number }): boolean;
   flushCheckpoint(): Promise<void>;
 }
@@ -177,12 +178,20 @@ export class Scheduler {
   private async onTimer(): Promise<void> {
     if (!this.started) return;
     const now = this.clock.now();
-    for (const [jobId, at] of this.occurrences) {
-      if (at.getTime() > now.getTime()) continue;
+    const due = [...this.occurrences.entries()].filter(
+      ([, at]) => at.getTime() <= now.getTime(),
+    );
+    for (const [jobId, at] of due) {
       const job = this.service.get(jobId);
-      if (job && isEligible(job, now) && !this.pending.has(jobId)) {
-        this.pending.set(jobId, at);
+      if (!job || !isEligible(job, now) || this.pending.has(jobId)) continue;
+      if (job.overlap === "skip" && this.runningJobId === jobId) {
+        await this.service.recordSkip(jobId, at);
+        if (this.service.shouldFlushCheckpoint(CHECKPOINT_POLICY)) {
+          await this.service.flushCheckpoint();
+        }
+        continue;
       }
+      this.pending.set(jobId, at);
     }
 
     // Recompute from wall-clock time. This intentionally skips catch-up and

@@ -44,6 +44,7 @@ export interface CreationFields {
   schedule: ScheduleInput;
   timezone?: string;
   execution?: ExecutionDraft;
+  overlap?: CronJob["overlap"];
   expires?: string;
   maxRuns?: number;
   tokenBudget?: number;
@@ -190,6 +191,7 @@ function fromCreateInput(input: CreateInput): CreationFields {
     prompt: input.prompt,
     schedule: input.schedule,
     execution: input.execution,
+    overlap: input.overlap,
     expires: input.expires,
     maxRuns: input.maxRuns,
     tokenBudget: input.tokenBudget,
@@ -214,6 +216,7 @@ export function buildJobDraft(
       input.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
     ),
     execution: resolveExecution(pi, ctx, input.execution),
+    overlap: input.overlap,
     expiresAt: resolveExpiry(input.expires, now),
     maxRuns: input.maxRuns,
     tokenBudget: input.tokenBudget,
@@ -249,6 +252,7 @@ export function buildJobPatch(
       current?.execution,
     );
   }
+  if (patch.overlap !== undefined) output.overlap = patch.overlap;
   if (patch.expires !== undefined)
     output.expiresAt = resolveExpiry(patch.expires, now);
   if (patch.maxRuns !== undefined) output.maxRuns = patch.maxRuns;
@@ -332,7 +336,10 @@ export function formatJobList(jobs: CronJob[]): string {
     .map((job) => {
       const last = job.lastTechnicalOutcome ?? "never";
       const settled = job.lastSettledAt ?? "never";
-      return `${job.id}  ${job.state.padEnd(9)}  ${job.name}  ${describeSchedule(job.schedule)}  ${formatListExecution(job)}  runs=${job.runCount}  last=${last}  settled=${settled}`;
+      const overlap = job.overlap ?? "queue";
+      const skipped = job.skippedRuns ?? 0;
+      const lastSkipped = job.lastSkippedAt ?? "never";
+      return `${job.id}  ${job.state.padEnd(9)}  ${job.name}  ${describeSchedule(job.schedule)}  ${formatListExecution(job)}  overlap=${overlap}  runs=${job.runCount}  skipped=${skipped}  lastSkipped=${lastSkipped}  last=${last}  settled=${settled}`;
     })
     .join("\n");
 }
@@ -354,7 +361,10 @@ export function formatJob(job: CronJob): string {
     `State: ${job.state}`,
     `Schedule: ${describeSchedule(job.schedule)}`,
     `Execution: ${job.execution.kind}`,
+    `Overlap: ${job.overlap ?? "queue"}`,
     `Runs: ${job.runCount}`,
+    `Skipped: ${job.skippedRuns ?? 0}`,
+    `Last skipped: ${job.lastSkippedAt ?? "never"}`,
     `Expires: ${job.expiresAt}`,
   ].join("\n");
 }

@@ -65,7 +65,8 @@ export function registerCronTools(
   pi.registerTool({
     name: "cron_list",
     label: "Cron List",
-    description: "List session-scoped cron jobs and runtime status.",
+    description:
+      "List session-scoped cron jobs, overlap policy, skip history, and runtime status.",
     promptSnippet:
       "List active, paused, missed, completed, and expired cron jobs",
     promptGuidelines: [
@@ -238,6 +239,7 @@ function creationFromTool(input: CronCreateInput): CreationFields {
     schedule: scheduleFromTool(input),
     timezone: input.timezone,
     execution: executionFromTool(input),
+    overlap: input.overlap,
     expires: input.expires,
     maxRuns: input.maxRuns,
     tokenBudget: input.tokenBudget,
@@ -269,6 +271,7 @@ function patchFromTool(
       current.execution.kind === "isolated",
     );
   }
+  if (input.overlap !== undefined) patch.overlap = input.overlap;
   if (input.expires !== undefined) patch.expires = input.expires;
   if (input.maxRuns !== undefined) patch.maxRuns = input.maxRuns;
   if (input.tokenBudget !== undefined) patch.tokenBudget = input.tokenBudget;
@@ -389,7 +392,8 @@ function formatMutationInput(
   input: MutationInput,
   kind: "create" | "update",
 ): string {
-  const parts = [formatInputSchedule(input, kind)];
+  const overlap = input.overlap ?? (kind === "create" ? "queue" : "unchanged");
+  const parts = [formatInputSchedule(input, kind), `overlap ${overlap}`];
   const changesExecution =
     input.mode !== undefined ||
     input.model !== undefined ||
@@ -467,7 +471,11 @@ function renderMutationResult(
 }
 
 function formatJobConfiguration(job: CronJob): string {
-  const parts = [describeSchedule(job.schedule), job.execution.kind];
+  const parts = [
+    describeSchedule(job.schedule),
+    `overlap ${job.overlap ?? "queue"}`,
+    job.execution.kind,
+  ];
   if (job.execution.kind === "main") {
     parts.push("tools inherited", "notify n/a");
   } else {

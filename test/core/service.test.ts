@@ -185,6 +185,8 @@ describe("CronService creation and validation", () => {
       id: "deadbeef",
       name: "Report",
       execution: { kind: "main" },
+      overlap: "queue",
+      skippedRuns: 0,
       createdAt: NOW,
       updatedAt: NOW,
       expiresAt: "2026-07-21T12:00:00.000Z",
@@ -602,6 +604,30 @@ describe("CronService execution authorization", () => {
 });
 
 describe("CronService metrics and observers", () => {
+  it("keeps legacy checkpoints mutable when skip metrics are absent", async () => {
+    const existing = storedJob();
+    const checkpoint: CronEvent = {
+      version: 1,
+      type: "metrics_checkpoint",
+      at: NOW,
+      jobs: [
+        {
+          id: existing.id,
+          runCount: 1,
+          attributedTokens: 10,
+          consecutiveFailures: 0,
+        },
+      ],
+    };
+    const { service } = makeService({
+      events: [created(existing), checkpoint],
+    });
+
+    await expect(service.pause(existing.id)).resolves.toMatchObject({
+      state: "paused",
+    });
+  });
+
   it("rejects unknown outcomes without changing registry, dirtiness, or observers", async () => {
     const existing = storedJob();
     const changed = vi.fn();
@@ -751,6 +777,47 @@ describe("CronService metrics and observers", () => {
     ).resolves.toBeUndefined();
     expect(dirtyAtNotification).toBe(true);
     expect(observerError).toHaveBeenCalledWith(expect.any(Error));
+  });
+
+  it("records skipped occurrences without counting them as runs or failures", async () => {
+    const existing = storedJob();
+    const store = new MemoryStore();
+    const { service } = makeService({
+      events: [created(existing)],
+      store,
+    });
+    const skippedAt = new Date("2026-07-14T13:00:00.000Z");
+    await expect(
+      service.recordSkip(existing.id, skippedAt),
+    ).resolves.toBeUndefined();
+    expect(service.get(existing.id)).toMatchObject({
+      runCount: 0,
+      consecutiveFailures: 0,
+      skippedRuns: 1,
+      lastSkippedAt: skippedAt.toISOString(),
+    });
+    expect(
+      service.shouldFlushCheckpoint({ maxRuns: 1, maxAgeMs: 60_000 }),
+    ).toBe(true);
+
+    await service.flushCheckpoint();
+    expect(store.appended.at(-1)).toMatchObject({
+      type: "metrics_checkpoint",
+      jobs: [
+        expect.objectContaining({
+          id: existing.id,
+          skippedRuns: 1,
+          lastSkippedAt: skippedAt.toISOString(),
+        }),
+      ],
+    });
+    const replayed = makeService({
+      events: [created(existing), ...store.appended],
+    }).service;
+    expect(replayed.get(existing.id)).toMatchObject({
+      skippedRuns: 1,
+      lastSkippedAt: skippedAt.toISOString(),
+    });
   });
 
   it("flushes all dirty metrics and retains dirtiness after append failure", async () => {

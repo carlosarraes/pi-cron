@@ -116,6 +116,8 @@ describe("reduceEvents", () => {
             runCount: 2,
             attributedTokens: 350,
             consecutiveFailures: 1,
+            skippedRuns: 3,
+            lastSkippedAt: "2026-07-14T23:00:00.000Z",
             lastOccurrenceAt: "2026-07-15T00:00:00.000Z",
             lastTechnicalOutcome: "failed",
           },
@@ -134,6 +136,8 @@ describe("reduceEvents", () => {
       runCount: 2,
       attributedTokens: 350,
       consecutiveFailures: 1,
+      skippedRuns: 3,
+      lastSkippedAt: "2026-07-14T23:00:00.000Z",
       lastTechnicalOutcome: "failed",
     });
     expect(jobs.has("deleted-job")).toBe(false);
@@ -155,6 +159,17 @@ describe("reduceEvents", () => {
     { version: 1, type: "unknown", at: "2026-07-14T12:00:00.000Z" },
   ])("fails safely on malformed event %#", (malformed) => {
     expect(() => reduceEvents([malformed as CronEvent])).toThrow(
+      "Malformed pi-cron event",
+    );
+  });
+
+  it("rejects an unknown overlap policy", () => {
+    const malformed = created(job()) as unknown as {
+      job: Record<string, unknown>;
+    };
+    malformed.job.overlap = "later";
+
+    expect(() => reduceEvents([malformed as unknown as CronEvent])).toThrow(
       "Malformed pi-cron event",
     );
   });

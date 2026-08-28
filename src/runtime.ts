@@ -453,6 +453,7 @@ function seedFromJob(job: CronJob): Partial<WizardState> {
           ? ""
           : `/${job.prompt.name}${job.prompt.args ? ` ${job.prompt.args}` : ""}`,
     execution: executionDraftFromJob(job),
+    overlap: job.overlap ?? "queue",
     limits: {
       expires: job.expiresAt,
       maxRuns: job.maxRuns,

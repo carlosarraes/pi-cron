@@ -19,6 +19,7 @@ export type Schedule =
     };
 
 export type JobState = "active" | "paused" | "missed" | "completed" | "expired";
+export type OverlapPolicy = "queue" | "skip";
 export type TechnicalOutcome =
   | "dispatched"
   | "settled"
@@ -55,6 +56,7 @@ export interface CronJob {
   schedule: Schedule;
   state: JobState;
   execution: ExecutionMode;
+  overlap?: OverlapPolicy;
   createdAt: string;
   updatedAt: string;
   expiresAt: string;
@@ -63,6 +65,8 @@ export interface CronJob {
   runCount: number;
   attributedTokens: number;
   consecutiveFailures: number;
+  skippedRuns?: number;
+  lastSkippedAt?: string;
   lastOccurrenceAt?: string;
   lastDispatchAt?: string;
   lastSettledAt?: string;
@@ -87,6 +91,8 @@ export type CronEvent =
           | "runCount"
           | "attributedTokens"
           | "consecutiveFailures"
+          | "skippedRuns"
+          | "lastSkippedAt"
           | "lastOccurrenceAt"
           | "lastDispatchAt"
           | "lastSettledAt"

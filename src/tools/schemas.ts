@@ -11,6 +11,7 @@ const Effort = StringEnum([
   "max",
 ] as const);
 const Mode = StringEnum(["main", "isolated"] as const);
+const Overlap = StringEnum(["queue", "skip"] as const);
 
 const CreationFields = {
   name: Type.Optional(Type.String({ minLength: 1 })),
@@ -22,6 +23,7 @@ const CreationFields = {
   adaptive: Type.Optional(Type.Boolean()),
   timezone: Type.Optional(Type.String()),
   mode: Type.Optional(Mode),
+  overlap: Type.Optional(Overlap),
   model: Type.Optional(Type.String()),
   effort: Type.Optional(Effort),
   notify: Type.Optional(Type.Boolean()),

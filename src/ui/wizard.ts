@@ -7,12 +7,13 @@ import {
   parseDuration,
   resolveSchedule,
 } from "../domain/schedule.js";
-import { DEFAULT_LIMITS } from "../domain/types.js";
+import { DEFAULT_LIMITS, type OverlapPolicy } from "../domain/types.js";
 
 export type WizardStep =
   | "schedule"
   | "prompt"
   | "execution"
+  | "overlap"
   | "limits"
   | "review";
 
@@ -28,6 +29,7 @@ export interface WizardState {
   schedule?: ScheduleInput;
   prompt: string;
   execution: ExecutionDraft;
+  overlap: OverlapPolicy;
   limits: LimitsDraft;
   error?: string;
   cancelled?: boolean;
@@ -37,6 +39,7 @@ export type WizardAction =
   | { type: "set_schedule"; schedule: ScheduleInput }
   | { type: "set_prompt"; prompt: string }
   | { type: "set_execution"; execution: ExecutionDraft }
+  | { type: "set_overlap"; overlap: OverlapPolicy }
   | { type: "set_limits"; limits: LimitsDraft }
   | { type: "next" }
   | { type: "back" }
@@ -49,6 +52,7 @@ const STEPS: WizardStep[] = [
   "schedule",
   "prompt",
   "execution",
+  "overlap",
   "limits",
   "review",
 ];
@@ -61,6 +65,7 @@ export function initialWizardState(
     schedule: seed.schedule,
     prompt: seed.prompt ?? "",
     execution: seed.execution ?? { kind: "main" },
+    overlap: seed.overlap ?? "queue",
     limits: seed.limits ?? {},
     error: seed.error,
   };
@@ -77,6 +82,8 @@ export function reduceWizard(
       return { ...state, prompt: action.prompt, error: undefined };
     case "set_execution":
       return { ...state, execution: action.execution, error: undefined };
+    case "set_overlap":
+      return { ...state, overlap: action.overlap, error: undefined };
     case "set_limits":
       return { ...state, limits: { ...action.limits }, error: undefined };
     case "back":
@@ -117,7 +124,7 @@ export async function runCronWizard(
   while (!state.cancelled) {
     switch (state.step) {
       case "schedule": {
-        const selected = await ctx.ui.select("1/5 Schedule", [
+        const selected = await ctx.ui.select("1/6 Schedule", [
           "Every 5m",
           "Every 15m",
           "Every 30m",
@@ -169,10 +176,10 @@ export async function runCronWizard(
         break;
       }
       case "prompt": {
-        const prompt = await ctx.ui.editor("2/5 Prompt", state.prompt);
+        const prompt = await ctx.ui.editor("2/6 Prompt", state.prompt);
         if (prompt === undefined) return undefined;
         state = reduceWizard(state, { type: "set_prompt", prompt });
-        const next = await ctx.ui.select("2/5 Prompt", [
+        const next = await ctx.ui.select("2/6 Prompt", [
           "Continue",
           "Back",
           "Cancel",
@@ -183,7 +190,7 @@ export async function runCronWizard(
         break;
       }
       case "execution": {
-        const choice = await ctx.ui.select("3/5 Execution", [
+        const choice = await ctx.ui.select("3/6 Execution", [
           "Main session — inherits model + effort at fire time",
           "Isolated",
           "Back",
@@ -210,8 +217,27 @@ export async function runCronWizard(
         state = reduceWizard(state, { type: "next" });
         break;
       }
+      case "overlap": {
+        const choice = await ctx.ui.select("4/6 Overlap", [
+          "Queue one missed run (default)",
+          "Skip ticks while this job is running",
+          "Back",
+          "Cancel",
+        ]);
+        if (choice === "Back") {
+          state = reduceWizard(state, { type: "back" });
+          break;
+        }
+        if (!choice || choice === "Cancel") return undefined;
+        state = reduceWizard(state, {
+          type: "set_overlap",
+          overlap: choice.startsWith("Skip") ? "skip" : "queue",
+        });
+        state = reduceWizard(state, { type: "next" });
+        break;
+      }
       case "limits": {
-        const choice = await ctx.ui.select("4/5 Limits", [
+        const choice = await ctx.ui.select("5/6 Limits", [
           "Use defaults (7d expiry, 3-failure pause)",
           "Customize",
           "Back",
@@ -246,7 +272,7 @@ export async function runCronWizard(
         const preview = buildDraft(state, new Date());
         const nextAt = nextOccurrence(preview.schedule, new Date());
         const choice = await ctx.ui.select(
-          `5/5 Review — next ${nextAt?.toISOString() ?? "none"}`,
+          `6/6 Review — next ${nextAt?.toISOString() ?? "none"}`,
           ["Continue to approval", "Back", "Cancel"],
         );
         if (choice === "Back") {
@@ -292,6 +318,7 @@ function buildDraft(state: WizardState, now: Date): JobDraft {
     prompt: { kind: "text", text: state.prompt },
     schedule: resolveSchedule(state.schedule, now),
     execution,
+    overlap: state.overlap,
     expiresAt: state.limits.expires
       ? parseExpiry(state.limits.expires, now)
       : undefined,

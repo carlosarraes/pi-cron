@@ -146,6 +146,20 @@ describe("cron tool schemas", () => {
     expect(
       Value.Check(CronCreateParams, { prompt: "x", every: "5m", extra: true }),
     ).toBe(false);
+    expect(
+      Value.Check(CronCreateParams, {
+        prompt: "x",
+        every: "5m",
+        overlap: "skip",
+      }),
+    ).toBe(true);
+    expect(
+      Value.Check(CronCreateParams, {
+        prompt: "x",
+        every: "5m",
+        overlap: "later",
+      }),
+    ).toBe(false);
     expect(Value.Check(CronWakeupParams, { delay: "5m" })).toBe(false);
   });
 });
@@ -176,6 +190,8 @@ describe("registerCronTools", () => {
   it("lists run history needed to confirm whether a job triggered", async () => {
     const current = job();
     current.runCount = 4;
+    current.skippedRuns = 2;
+    current.lastSkippedAt = NOW;
     current.lastTechnicalOutcome = "settled";
     current.lastSettledAt = NOW;
     current.execution = {
@@ -196,6 +212,9 @@ describe("registerCronTools", () => {
 
     expect(result.content[0].text).toContain("job-1");
     expect(result.content[0].text).toContain("runs=4");
+    expect(result.content[0].text).toContain("overlap=queue");
+    expect(result.content[0].text).toContain("skipped=2");
+    expect(result.content[0].text).toContain(`lastSkipped=${NOW}`);
     expect(result.content[0].text).toContain("last=settled");
     expect(result.content[0].text).toContain(`settled=${NOW}`);
     expect(result.content[0].text).toContain("exec=isolated");
@@ -222,13 +241,14 @@ describe("registerCronTools", () => {
 
     await execute(
       tools.get("cron_create"),
-      { prompt: "check", every: "5m" },
+      { prompt: "check", every: "5m", overlap: "skip" },
       ctx,
     );
 
-    expect(service.create).toHaveBeenCalledWith(expect.any(Object), {
-      approvalMode: "automatic",
-    });
+    expect(service.create).toHaveBeenCalledWith(
+      expect.objectContaining({ overlap: "skip" }),
+      { approvalMode: "automatic" },
+    );
   });
 
   it("rejects the tool-less isolated configuration from the failed Mac job", async () => {
@@ -310,7 +330,7 @@ describe("registerCronTools", () => {
 
     await execute(
       tools.get("cron_update"),
-      { selector: "job-1", notify: true },
+      { selector: "job-1", notify: true, overlap: "skip" },
       ctx,
     );
 
@@ -322,6 +342,7 @@ describe("registerCronTools", () => {
           tools: ["read", "bash"],
           notify: true,
         }),
+        overlap: "skip",
       }),
       { approvalMode: "automatic" },
     );
@@ -329,6 +350,9 @@ describe("registerCronTools", () => {
 
   it("shows create configuration while keeping the prompt collapsed", async () => {
     const isolated = job();
+    isolated.overlap = "skip";
+    isolated.skippedRuns = 1;
+    isolated.lastSkippedAt = NOW;
     isolated.execution = {
       kind: "isolated",
       model: "openai/model-a",
@@ -349,6 +373,7 @@ describe("registerCronTools", () => {
     const args = {
       prompt: "check the build",
       every: "5m",
+      overlap: "skip" as const,
       mode: "isolated",
       tools: ["read", "bash"],
       notify: false,
@@ -377,14 +402,15 @@ describe("registerCronTools", () => {
       .trimEnd();
 
     expect(collapsedCall).toBe(
-      "cron_create · every 5m · isolated · tools read,bash · notify off",
+      "cron_create · every 5m · overlap skip · isolated · tools read,bash · notify off",
     );
     expect(collapsedCall).not.toContain("check the build");
     expect(expandedCall).toContain('"prompt": "check the build"');
     expect(collapsedResult).toBe(
-      "Created Report (job-1) · every 1m · isolated · tools read,bash · notify off",
+      "Created Report (job-1) · every 1m · overlap skip · isolated · tools read,bash · notify off",
     );
     expect(expandedResult).toContain("Schedule: every 1m");
+    expect(expandedResult).toContain(`Last skipped: ${NOW}`);
   });
 
   it("shows inherited main-session resources without exposing the prompt", async () => {
@@ -408,11 +434,11 @@ describe("registerCronTools", () => {
       .trimEnd();
 
     expect(collapsedCall).toBe(
-      "cron_create · every 5m · main · tools inherited · notify n/a",
+      "cron_create · every 5m · overlap queue · main · tools inherited · notify n/a",
     );
     expect(collapsedCall).not.toContain("check the build");
     expect(collapsedResult).toBe(
-      "Created Report (job-1) · every 1m · main · tools inherited · notify n/a",
+      "Created Report (job-1) · every 1m · overlap queue · main · tools inherited · notify n/a",
     );
   });
 
@@ -432,7 +458,7 @@ describe("registerCronTools", () => {
       .trimEnd();
 
     expect(collapsedCall).toBe(
-      "cron_update job-1 · every 2h · mode unchanged · tools unchanged · notify unchanged",
+      "cron_update job-1 · every 2h · overlap unchanged · mode unchanged · tools unchanged · notify unchanged",
     );
   });
 
@@ -475,14 +501,14 @@ describe("registerCronTools", () => {
       .trimEnd();
 
     expect(collapsedCall).toBe(
-      "cron_update job-1 · every 2h · isolated · tools read,bash · notify on",
+      "cron_update job-1 · every 2h · overlap unchanged · isolated · tools read,bash · notify on",
     );
     expect(collapsedCall).not.toContain("new instructions");
     expect(expandedCall).toContain('"prompt": "new instructions"');
     expect(expandedCall).toContain('"every": "2h"');
     expect(expandedCall).toContain('"maxRuns": 3');
     expect(collapsedResult).toBe(
-      "Updated Report (job-1) · every 1m · main · tools inherited · notify n/a",
+      "Updated Report (job-1) · every 1m · overlap queue · main · tools inherited · notify n/a",
     );
     expect(expandedResult).toContain("Schedule: every 1m");
   });

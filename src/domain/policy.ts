@@ -69,6 +69,7 @@ export function requiresReapproval(before: CronJob, after: CronJob): boolean {
     promptFingerprint(before.prompt) !== promptFingerprint(after.prompt) ||
     scheduleRaisesPrivilege(before.schedule, after.schedule) ||
     expiryRaisesPrivilege(before.expiresAt, after.expiresAt) ||
+    overlapRaisesPrivilege(before.overlap, after.overlap) ||
     raisesExecutionPrivilege(before.execution, after.execution) ||
     raisesLimit(before.maxRuns, after.maxRuns) ||
     raisesLimit(before.tokenBudget, after.tokenBudget)
@@ -125,6 +126,13 @@ function expiryRaisesPrivilege(before: string, after: string): boolean {
   const afterMs = Date.parse(after);
   if (!Number.isFinite(beforeMs) || !Number.isFinite(afterMs)) return true;
   return afterMs > beforeMs;
+}
+
+function overlapRaisesPrivilege(
+  before: CronJob["overlap"],
+  after: CronJob["overlap"],
+): boolean {
+  return (before ?? "queue") === "skip" && (after ?? "queue") === "queue";
 }
 
 function raisesExecutionPrivilege(

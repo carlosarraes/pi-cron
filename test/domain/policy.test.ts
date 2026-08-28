@@ -218,6 +218,12 @@ describe("requiresReapproval", () => {
     );
   });
 
+  it("requires approval when changing overlap from skip to queue", () => {
+    expect(
+      requiresReapproval(job({ overlap: "skip" }), job({ overlap: "queue" })),
+    ).toBe(true);
+  });
+
   it.each([
     ["rename", { name: "Renamed" }],
     ["pause", { state: "paused" }],
@@ -234,6 +240,7 @@ describe("requiresReapproval", () => {
     ["shorter expiry", { expiresAt: "2026-07-20T12:00:00.000Z" }],
     ["smaller max-runs cap", { maxRuns: 9 }],
     ["smaller token cap", { tokenBudget: 999 }],
+    ["skip overlap policy", { overlap: "skip" }],
     [
       "reduced resources and limits",
       {

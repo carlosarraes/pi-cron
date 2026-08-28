@@ -54,13 +54,14 @@ Only currently loaded skills and prompt templates are schedulable. Built-in inte
 
 ## Guided creation
 
-Run `/cron add` without flags for the five-step guided flow:
+Run `/cron add` without flags for the six-step guided flow:
 
 1. **Schedule** — presets, custom intervals, cron, one-shot, or adaptive.
 2. **Prompt** — multiline text.
 3. **Execution** — main session or isolated model/resources.
-4. **Limits** — expiry, run cap, token budget, and isolated timeout.
-5. **Review** — exact next occurrence before the approval preview.
+4. **Overlap** — queue one missed run or skip ticks while the job is running.
+5. **Limits** — expiry, run cap, token budget, and isolated timeout.
+6. **Review** — exact next occurrence before the approval preview.
 
 Back navigation retains entered values. Cancelling mutates nothing. Guided creation requires TUI or RPC mode; JSON/print users should use strict `/cron add` flags.
 
@@ -109,6 +110,19 @@ One-shots do not receive an immediate first run. A one-shot fires at most once a
 
 An adaptive job runs immediately once. During each run the agent must call `cron_wakeup` with either a delay from `1m` through `1h`, or `stop: true`, plus a reason. One omission gets a 20-minute fallback; a second consecutive omission pauses the job.
 
+### Overlap policy
+
+Queueing is the backward-compatible default: if a tick arrives while the same job is running, one missed run remains pending and repeated ticks coalesce.
+
+Use `skip` when stale work should be dropped instead:
+
+```text
+/cron add --every 1h --overlap skip --prompt "check current status"
+/cron edit <id-or-name> --overlap skip
+```
+
+With `skip`, due ticks are recorded as skipped while that job is running. The next tick starts normally once the previous run has finished. Other jobs and manually busy Pi sessions retain the existing bounded queue behavior.
+
 ## Execution modes
 
 ### Main session
@@ -145,7 +159,7 @@ Model names may be exact `provider/id` values or unique fuzzy matches. Unsupport
 - Optional `--max-runs` and `--budget` caps stop further dispatches.
 - Scheduled runs cannot recursively create cron jobs. Adaptive wakeup/self-stop is the only scheduling mutation allowed during a scheduled execution.
 - All jobs share global cron concurrency of one.
-- If Pi is busy, repeated occurrences coalesce into one pending run. Pending jobs drain oldest-first without catch-up bursts.
+- With the default `queue` overlap policy, repeated occurrences coalesce into one pending run. With `skip`, ticks due while that same job is running are dropped and counted. Pending jobs drain oldest-first without catch-up bursts.
 - A per-session lease under Pi's agent directory prevents two Pi processes from scheduling the same session. The non-owner remains read-only.
 - Shutdown clears timers, aborts isolated work, checkpoints metrics, releases the lease, and clears footer state.
 
@@ -190,7 +204,7 @@ Text commands work in every mode:
 /cron stop --all
 ```
 
-Selectors accept an exact ID, exact case-insensitive name, or an unambiguous ID/name prefix. List output includes execution mode/resources, run count, last technical outcome, and last settlement time so a triggered job is observable without reading session storage.
+Selectors accept an exact ID, exact case-insensitive name, or an unambiguous ID/name prefix. List output includes execution mode/resources, overlap policy, run and skip counts, last skipped tick, last technical outcome, and last settlement time so a triggered job is observable without reading session storage.
 
 The agent-facing tools are `cron_create`, `cron_list`, `cron_update`, `cron_delete`, `cron_run`, and `cron_wakeup`.
 

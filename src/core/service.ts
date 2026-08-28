@@ -15,6 +15,7 @@ import {
   type DispatchResult,
   type EventStore,
   type ExecutionMode,
+  type OverlapPolicy,
   type ProposedJob,
   type Schedule,
   type TechnicalOutcome,
@@ -34,6 +35,7 @@ export interface JobDraft {
   prompt: CronJob["prompt"];
   schedule: Schedule;
   execution?: ExecutionMode;
+  overlap?: OverlapPolicy;
   expiresAt?: string;
   maxRuns?: number;
   tokenBudget?: number;
@@ -329,6 +331,24 @@ export class CronService {
     });
   }
 
+  recordSkip(jobId: string, scheduledAt: Date): Promise<void> {
+    return this.enqueueMutation(() => {
+      if (!Number.isFinite(scheduledAt.getTime())) {
+        throw new Error("Invalid skipped occurrence timestamp");
+      }
+      const before = this.requireJob(jobId);
+      const skippedRuns = (before.skippedRuns ?? 0) + 1;
+      validateCounter("skippedRuns", skippedRuns);
+      this.jobs.set(jobId, {
+        ...before,
+        skippedRuns,
+        lastSkippedAt: scheduledAt.toISOString(),
+      });
+      this.markCheckpointDirty(1);
+      this.notifyChanged();
+    });
+  }
+
   shouldFlushCheckpoint(policy: CheckpointPolicy): boolean {
     if (this.dirtySinceMs === undefined) return false;
     return (
@@ -593,6 +613,7 @@ function buildProposedJob(
     schedule: structuredClone(draft.schedule),
     state: "active",
     execution: structuredClone(draft.execution ?? { kind: "main" }),
+    overlap: draft.overlap ?? "queue",
     createdAt: timestamp,
     updatedAt: timestamp,
     expiresAt:
@@ -601,6 +622,7 @@ function buildProposedJob(
     runCount: 0,
     attributedTokens: 0,
     consecutiveFailures: 0,
+    skippedRuns: 0,
     originSessionId: sessionId,
   };
   if (draft.maxRuns !== undefined) proposed.maxRuns = draft.maxRuns;
@@ -615,6 +637,7 @@ function applyPatch(before: CronJob, patch: JobPatch, now: Date): CronJob {
     prompt: structuredClone(patch.prompt ?? before.prompt),
     schedule: structuredClone(patch.schedule ?? before.schedule),
     execution: structuredClone(patch.execution ?? before.execution),
+    overlap: patch.overlap ?? before.overlap ?? "queue",
     expiresAt: patch.expiresAt ?? before.expiresAt,
     updatedAt: now.toISOString(),
   };
@@ -767,6 +790,10 @@ function withMetrics(job: CronJob, metrics: CronJob): CronJob {
     attributedTokens: metrics.attributedTokens,
     consecutiveFailures: metrics.consecutiveFailures,
   };
+  if (metrics.skippedRuns !== undefined) {
+    merged.skippedRuns = metrics.skippedRuns;
+  }
+  copyOptionalMetric(merged, metrics, "lastSkippedAt");
   copyOptionalMetric(merged, metrics, "lastOccurrenceAt");
   copyOptionalMetric(merged, metrics, "lastDispatchAt");
   copyOptionalMetric(merged, metrics, "lastSettledAt");
@@ -781,7 +808,11 @@ function withMetrics(job: CronJob, metrics: CronJob): CronJob {
 function copyOptionalMetric(
   target: CronJob,
   source: CronJob,
-  key: "lastOccurrenceAt" | "lastDispatchAt" | "lastSettledAt",
+  key:
+    | "lastSkippedAt"
+    | "lastOccurrenceAt"
+    | "lastDispatchAt"
+    | "lastSettledAt",
 ): void {
   const value = source[key];
   if (value === undefined) delete target[key];
@@ -794,7 +825,11 @@ function toMetrics(job: CronJob): JobMetrics {
     runCount: job.runCount,
     attributedTokens: job.attributedTokens,
     consecutiveFailures: job.consecutiveFailures,
+    skippedRuns: job.skippedRuns ?? 0,
   };
+  if (job.lastSkippedAt !== undefined) {
+    metrics.lastSkippedAt = job.lastSkippedAt;
+  }
   if (job.lastOccurrenceAt !== undefined) {
     metrics.lastOccurrenceAt = job.lastOccurrenceAt;
   }
