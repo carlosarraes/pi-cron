@@ -1,7 +1,7 @@
 {
   "name": "pi-cron",
   "version": "0.1.0",
-  "description": "Session-scoped fixed, adaptive, cron, and one-shot prompt scheduling for Pi",
+  "description": "Session-scoped and project-saved fixed, adaptive, cron, and one-shot prompt scheduling for Pi",
   "type": "module",
   "license": "MIT",
   "author": "carraes",

@@ -1,8 +1,8 @@
 # pi-cron
 
-Session-scoped scheduled prompts for Pi: fixed intervals, five-field cron, one-shots, adaptive loops, and isolated runs.
+Session-scoped and project-saved scheduled prompts for Pi: fixed intervals, five-field cron, one-shots, adaptive loops, and isolated runs.
 
-`pi-cron` runs only while the owning Pi session is open. Jobs are stored in the session branch, survive resume/reload, and follow forks safely; it is not an offline daemon.
+`pi-cron` runs only while the owning Pi session is open; it is not an offline daemon. Normal jobs are stored in the session branch, survive resume/reload, and follow forks safely. Project-saved definitions persist reusable configuration separately and never start until explicitly requested.
 
 ## Install
 
@@ -64,6 +64,30 @@ Run `/cron add` without flags for the six-step guided flow:
 6. **Review** — exact next occurrence before the approval preview.
 
 Back navigation retains entered values. Cancelling mutates nothing. Guided creation requires TUI or RPC mode; JSON/print users should use strict `/cron add` flags.
+
+## Project-saved definitions
+
+Saved definitions keep only reusable cron configuration—prompt, schedule, execution resources, overlap policy, expiry duration, and limits—for later use in the same project. They do not include conversation history, runtime state, run metrics, or an active timer.
+
+Create a stopped definition directly, copy a session job, inspect or edit saved configuration, start it in the current session, or delete it:
+
+```text
+/cron save add --every 1h --prompt "do X"
+/cron save current-job --name reusable-x
+/cron saved
+/cron saved show reusable-x
+/cron saved edit reusable-x --overlap skip
+/cron start reusable-x
+/cron saved delete reusable-x
+```
+
+Definitions live in the trusted project at `.pi/crons.json`. The file is human-readable plaintext: prompts may be exposed if it is committed to version control. Saved commands and tools reject untrusted projects rather than reading or changing the file.
+
+Starting a definition creates a session-scoped activation from its latest configuration. Relative one-shots, interval anchors, and expiry durations are resolved again from activation time; counters and runtime timestamps start fresh. Editing or deleting the saved definition does not alter an already active copy.
+
+An activation runs only while its owning session is open. Pi process restarts and later session restoration pause saved-origin activations before scheduling; explicitly use `/cron resume <activation>` to continue that session snapshot, or `/cron start <saved>` to refresh from the latest saved definition with fresh counters. `/reload` continues an activation in the same open session. Normal session jobs retain their existing resume behavior.
+
+No saved definition runs offline, catches up ticks missed while Pi was closed, or starts automatically after Pi or the PC restarts.
 
 ## Schedule reference
 
@@ -157,7 +181,7 @@ Model names may be exact `provider/id` values or unique fuzzy matches. Unsupport
 - Normal recurring cadence is at least one minute.
 - Development-only sub-minute intervals require both `--unsafe-seconds` and `--max-runs`.
 - Optional `--max-runs` and `--budget` caps stop further dispatches.
-- Scheduled runs cannot recursively create cron jobs. Adaptive wakeup/self-stop is the only scheduling mutation allowed during a scheduled execution.
+- Scheduled runs cannot recursively create cron jobs or create, copy, update, delete, or start saved definitions. Adaptive wakeup/self-stop is the only scheduling mutation allowed during a scheduled execution.
 - All jobs share global cron concurrency of one.
 - With the default `queue` overlap policy, repeated occurrences coalesce into one pending run. With `skip`, ticks due while that same job is running are dropped and counted. Pending jobs drain oldest-first without catch-up bursts.
 - A per-session lease under Pi's agent directory prevents two Pi processes from scheduling the same session. The non-owner remains read-only.
@@ -206,7 +230,18 @@ Text commands work in every mode:
 
 Selectors accept an exact ID, exact case-insensitive name, or an unambiguous ID/name prefix. List output includes execution mode/resources, overlap policy, run and skip counts, last skipped tick, last technical outcome, and last settlement time so a triggered job is observable without reading session storage.
 
-The agent-facing tools are `cron_create`, `cron_list`, `cron_update`, `cron_delete`, `cron_run`, and `cron_wakeup`.
+Session-job tools are `cron_create`, `cron_list`, `cron_update`, `cron_delete`, `cron_run`, and `cron_wakeup`.
+
+Project-saved tools are:
+
+| Tool | Purpose |
+| --- | --- |
+| `cron_saved_create` | Create a stopped project definition without starting it. |
+| `cron_saved_copy` | Copy one current session job into a stopped definition. |
+| `cron_saved_list` | List saved definitions for the trusted project. |
+| `cron_saved_update` | Update saved configuration without changing active copies. |
+| `cron_saved_delete` | Delete a definition without stopping active copies. |
+| `cron_saved_start` | Start a fresh activation in the current session only. |
 
 ## Development
 
