@@ -6,7 +6,9 @@ import type {
 import { Value } from "typebox/value";
 import { describe, expect, it, vi } from "vitest";
 import type { CronRuntimeRef } from "../../src/commands/register.js";
+import type { SavedCronService } from "../../src/core/saved-service.js";
 import type { CronService } from "../../src/core/service.js";
+import type { SavedCronDefinition } from "../../src/domain/saved.js";
 import type { CronJob } from "../../src/domain/types.js";
 import { registerCronTools } from "../../src/tools/register.js";
 import {
@@ -14,6 +16,12 @@ import {
   CronDeleteParams,
   CronListParams,
   CronRunParams,
+  CronSavedCopyParams,
+  CronSavedCreateParams,
+  CronSavedDeleteParams,
+  CronSavedListParams,
+  CronSavedStartParams,
+  CronSavedUpdateParams,
   CronUpdateParams,
   CronWakeupParams,
 } from "../../src/tools/schemas.js";
@@ -79,8 +87,32 @@ function job(): CronJob {
   };
 }
 
-function setup(overrides: Partial<CronService> = {}) {
+function savedDefinition(
+  overrides: Partial<SavedCronDefinition> = {},
+): SavedCronDefinition {
+  return {
+    version: 1,
+    id: "save1234",
+    name: "Saved report",
+    prompt: { kind: "text", text: "Saved secret" },
+    schedule: { kind: "interval", intervalMs: 300_000 },
+    execution: { kind: "main" },
+    overlap: "queue",
+    unsafeSeconds: false,
+    expiresAfterMs: 7 * 24 * 60 * 60_000,
+    createdAt: NOW,
+    updatedAt: NOW,
+    approval: { approvedAt: NOW, fingerprint: "saved-ok" },
+    ...overrides,
+  };
+}
+
+function setup(
+  overrides: Partial<CronService> = {},
+  savedOverrides: Partial<SavedCronService> = {},
+) {
   const current = job();
+  const saved = savedDefinition();
   const service = {
     list: vi.fn(() => [current]),
     get: vi.fn((id: string) => (id === current.id ? current : undefined)),
@@ -91,6 +123,15 @@ function setup(overrides: Partial<CronService> = {}) {
     delete: vi.fn(async () => undefined),
     ...overrides,
   } as unknown as CronService;
+  const savedService = {
+    list: vi.fn(async () => [saved]),
+    select: vi.fn(async () => saved),
+    create: vi.fn(async () => saved),
+    copy: vi.fn(async () => saved),
+    replace: vi.fn(async () => saved),
+    delete: vi.fn(async () => undefined),
+    ...savedOverrides,
+  } as unknown as SavedCronService;
   const tools = new Map<string, CapturedTool>();
   const pi = {
     registerTool: (tool: unknown) => {
@@ -102,15 +143,16 @@ function setup(overrides: Partial<CronService> = {}) {
   } as unknown as ExtensionAPI;
   const applyWakeup = vi.fn(async () => undefined);
   const runNow = vi.fn(async () => undefined);
+  const assertSavedMutationAllowed = vi.fn();
+  const startSaved = vi.fn(async () => ({
+    ...current,
+    savedDefinitionId: saved.id,
+  }));
   const runtime: CronRuntimeRef = {
     requireService: () => service,
-    requireSavedService: () => {
-      throw new Error("Saved cron definitions are unavailable in this test");
-    },
-    assertSavedMutationAllowed: () => undefined,
-    startSaved: async () => {
-      throw new Error("Saved cron activation is unavailable in this test");
-    },
+    requireSavedService: () => savedService,
+    assertSavedMutationAllowed,
+    startSaved,
     getScheduler: () => ({
       runNow,
       getRuntimeStatus: () => ({ state: "idle" }),
@@ -124,7 +166,16 @@ function setup(overrides: Partial<CronService> = {}) {
   const ctx = {
     model: { provider: "openai", id: "model-a" },
   } as ExtensionContext;
-  return { tools, service, applyWakeup, runNow, ctx };
+  return {
+    tools,
+    service,
+    savedService,
+    assertSavedMutationAllowed,
+    startSaved,
+    applyWakeup,
+    runNow,
+    ctx,
+  };
 }
 
 async function execute(
@@ -137,7 +188,7 @@ async function execute(
 }
 
 describe("cron tool schemas", () => {
-  it("defines all six strict schemas", () => {
+  it("defines all twelve strict schemas", () => {
     expect(Value.Check(CronCreateParams, { prompt: "x", every: "5m" })).toBe(
       true,
     );
@@ -168,6 +219,49 @@ describe("cron tool schemas", () => {
       }),
     ).toBe(false);
     expect(Value.Check(CronWakeupParams, { delay: "5m" })).toBe(false);
+
+    expect(
+      Value.Check(CronSavedCreateParams, { prompt: "x", every: "5m" }),
+    ).toBe(true);
+    expect(
+      Value.Check(CronSavedCopyParams, {
+        selector: "job",
+        name: "template",
+      }),
+    ).toBe(true);
+    expect(Value.Check(CronSavedListParams, {})).toBe(true);
+    expect(
+      Value.Check(CronSavedUpdateParams, {
+        selector: "template",
+        overlap: "skip",
+      }),
+    ).toBe(true);
+    expect(Value.Check(CronSavedDeleteParams, { selector: "template" })).toBe(
+      true,
+    );
+    expect(Value.Check(CronSavedStartParams, { selector: "template" })).toBe(
+      true,
+    );
+    expect(
+      Value.Check(CronSavedUpdateParams, {
+        selector: "template",
+        state: "paused",
+      }),
+    ).toBe(false);
+    expect(
+      Value.Check(CronSavedCreateParams, {
+        prompt: "x",
+        every: "5m",
+        extra: true,
+      }),
+    ).toBe(false);
+    expect(Value.Check(CronSavedCopyParams, {})).toBe(false);
+    expect(
+      Value.Check(CronSavedCopyParams, {
+        selector: "job",
+        name: "x".repeat(101),
+      }),
+    ).toBe(false);
   });
 });
 
@@ -181,6 +275,12 @@ describe("registerCronTools", () => {
       "cron_delete",
       "cron_run",
       "cron_wakeup",
+      "cron_saved_create",
+      "cron_saved_copy",
+      "cron_saved_list",
+      "cron_saved_update",
+      "cron_saved_delete",
+      "cron_saved_start",
     ]);
     for (const tool of tools.values()) {
       expect(tool.promptSnippet).toBeTruthy();
@@ -592,6 +692,169 @@ describe("registerCronTools", () => {
       ctx,
     );
     expect(applyWakeup).toHaveBeenCalledWith({ delay: "5m", reason: "later" });
+  });
+
+  it("creates and copies stopped saved definitions with automatic approval", async () => {
+    const { tools, savedService, assertSavedMutationAllowed, ctx } = setup();
+
+    await execute(
+      tools.get("cron_saved_create"),
+      { prompt: "save this", every: "5m", overlap: "skip" },
+      ctx,
+    );
+    expect(assertSavedMutationAllowed).toHaveBeenCalledTimes(1);
+    expect(savedService.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        prompt: { kind: "text", text: "save this" },
+        schedule: { kind: "interval", intervalMs: 300_000 },
+        overlap: "skip",
+      }),
+      { approvalMode: "automatic" },
+    );
+
+    await execute(
+      tools.get("cron_saved_copy"),
+      { selector: "job-1", name: "Reusable" },
+      ctx,
+    );
+    expect(assertSavedMutationAllowed).toHaveBeenCalledTimes(2);
+    expect(savedService.copy).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "job-1" }),
+      "Reusable",
+      { approvalMode: "automatic" },
+    );
+  });
+
+  it("lists saved definitions without requiring mutation access", async () => {
+    const { tools, savedService, assertSavedMutationAllowed, ctx } = setup();
+
+    const result = await execute(tools.get("cron_saved_list"), {}, ctx);
+
+    expect(savedService.list).toHaveBeenCalledOnce();
+    expect(assertSavedMutationAllowed).not.toHaveBeenCalled();
+    expect(result.content[0].text).toContain("save1234  stopped");
+    expect(result.content[0].text).not.toContain("Saved secret");
+  });
+
+  it("updates and deletes saved definitions through guarded mutations", async () => {
+    const { tools, savedService, assertSavedMutationAllowed, ctx } = setup();
+
+    await execute(
+      tools.get("cron_saved_update"),
+      { selector: "saved", every: "2h", overlap: "skip" },
+      ctx,
+    );
+    expect(savedService.select).toHaveBeenCalledWith("saved");
+    expect(savedService.replace).toHaveBeenCalledWith(
+      "save1234",
+      expect.objectContaining({
+        schedule: { kind: "interval", intervalMs: 7_200_000 },
+        overlap: "skip",
+      }),
+      { approvalMode: "automatic" },
+    );
+
+    await execute(tools.get("cron_saved_delete"), { selector: "saved" }, ctx);
+    expect(savedService.delete).toHaveBeenCalledWith("save1234");
+    expect(assertSavedMutationAllowed).toHaveBeenCalledTimes(2);
+  });
+
+  it("starts a saved definition in the current session with automatic approval", async () => {
+    const { tools, startSaved, assertSavedMutationAllowed, ctx } = setup();
+
+    const result = await execute(
+      tools.get("cron_saved_start"),
+      { selector: "saved" },
+      ctx,
+    );
+
+    expect(startSaved).toHaveBeenCalledWith("saved", "automatic");
+    expect(assertSavedMutationAllowed).not.toHaveBeenCalled();
+    expect(result.content[0].text).toContain("Started Report (job-1)");
+    expect(result.details).toEqual(
+      expect.objectContaining({
+        job: expect.objectContaining({ savedDefinitionId: "save1234" }),
+      }),
+    );
+  });
+
+  it("rejects invalid saved schedules before catalog mutation", async () => {
+    const { tools, savedService, ctx } = setup();
+
+    await expect(
+      execute(
+        tools.get("cron_saved_create"),
+        { prompt: "x", every: "5m", adaptive: true },
+        ctx,
+      ),
+    ).rejects.toThrow("exactly one schedule");
+    expect(savedService.create).not.toHaveBeenCalled();
+
+    await expect(
+      execute(tools.get("cron_saved_create"), { prompt: "x" }, ctx),
+    ).rejects.toThrow("exactly one schedule");
+  });
+
+  it("propagates saved catalog trust failures", async () => {
+    const configured = setup(
+      {},
+      {
+        list: vi.fn(async () => {
+          throw new Error("Saved cron definitions require a trusted project");
+        }),
+      },
+    );
+
+    await expect(
+      execute(configured.tools.get("cron_saved_list"), {}, configured.ctx),
+    ).rejects.toThrow("trusted project");
+  });
+
+  it("keeps saved mutation prompts out of collapsed rendering", async () => {
+    const { tools, ctx } = setup();
+    const create = tools.get("cron_saved_create");
+    const update = tools.get("cron_saved_update");
+    if (!create?.renderCall || !create.renderResult || !update?.renderCall) {
+      throw new Error("saved mutation renderers were not registered");
+    }
+    const theme = fakeTheme();
+    const args = {
+      prompt: "secret prompt",
+      every: "5m",
+      mode: "isolated" as const,
+      tools: ["read"],
+      overlap: "skip" as const,
+    };
+    const collapsedCall = create
+      .renderCall(args, theme, { expanded: false })
+      .render(1_000)
+      .join("\n");
+    const expandedCall = create
+      .renderCall(args, theme, { expanded: true })
+      .render(1_000)
+      .join("\n");
+    const result = await execute(create, args, ctx);
+    const collapsedResult = create
+      .renderResult(result, { expanded: false }, theme)
+      .render(1_000)
+      .join("\n");
+    const collapsedUpdate = update
+      .renderCall(
+        { selector: "saved", prompt: "new secret", every: "2h" },
+        theme,
+        { expanded: false },
+      )
+      .render(1_000)
+      .join("\n");
+
+    expect(collapsedCall).toContain("every 5m");
+    expect(collapsedCall).toContain("tools read");
+    expect(collapsedCall).toContain("overlap skip");
+    expect(collapsedCall).not.toContain("secret prompt");
+    expect(expandedCall).toContain("secret prompt");
+    expect(collapsedResult).toContain("save1234  stopped");
+    expect(collapsedResult).not.toContain("Saved secret");
+    expect(collapsedUpdate).not.toContain("new secret");
   });
 
   it("fails wakeup outside an active main execution", async () => {

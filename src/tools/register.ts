@@ -12,8 +12,15 @@ import {
   type CronRuntimeRef,
   formatJob,
   formatJobList,
+  formatSavedDefinition,
+  formatSavedDefinitionList,
   selectJobFromService,
 } from "../commands/register.js";
+import {
+  savedDraftFromJobDraft,
+  savedPatchFromJobPatch,
+} from "../core/saved-conversion.js";
+import type { SavedCronDefinition } from "../domain/saved.js";
 import { describeSchedule } from "../domain/schedule.js";
 import type { CronJob } from "../domain/types.js";
 import {
@@ -22,6 +29,14 @@ import {
   CronDeleteParams,
   CronListParams,
   CronRunParams,
+  CronSavedCopyParams,
+  type CronSavedCreateInput,
+  CronSavedCreateParams,
+  CronSavedDeleteParams,
+  CronSavedListParams,
+  CronSavedStartParams,
+  type CronSavedUpdateInput,
+  CronSavedUpdateParams,
   type CronUpdateInput,
   CronUpdateParams,
   CronWakeupParams,
@@ -230,6 +245,198 @@ export function registerCronTools(
     },
     renderResult: renderCronResult,
   });
+
+  pi.registerTool({
+    name: "cron_saved_create",
+    label: "Cron Saved Create",
+    description:
+      "Create one stopped project-saved cron definition without starting it.",
+    promptSnippet: "Save reusable cron configuration for this project",
+    promptGuidelines: [
+      "cron_saved_create stores a stopped definition; it never activates a session job.",
+      "Use cron_saved_list before later update, delete, or start operations when the exact saved ID is unknown.",
+    ],
+    parameters: CronSavedCreateParams,
+    async execute(_id, input, _signal, _update, ctx) {
+      runtime.assertSavedMutationAllowed();
+      const now = new Date();
+      const jobDraft = buildJobDraft(pi, ctx, creationFromTool(input), now);
+      const definition = await runtime
+        .requireSavedService()
+        .create(savedDraftFromJobDraft(jobDraft, now), {
+          approvalMode: "automatic",
+        });
+      return savedToolResult(
+        `Saved ${definition.name} (${definition.id}); it is stopped`,
+        definition,
+      );
+    },
+    renderCall: (args, theme, context) =>
+      renderMutationCall(
+        `cron_saved_create ${args.name ?? ""}`.trim(),
+        args,
+        "create",
+        context.expanded,
+        theme,
+      ),
+    renderResult: renderSavedMutationResult,
+  });
+
+  pi.registerTool({
+    name: "cron_saved_copy",
+    label: "Cron Saved Copy",
+    description:
+      "Copy one session cron job into a stopped project-saved definition.",
+    promptSnippet: "Save an existing session cron job for later reuse",
+    promptGuidelines: [
+      "cron_saved_copy stores configuration only and leaves the definition stopped.",
+      "Use cron_list first when the session-job selector is ambiguous, then cron_saved_list before later saved mutations.",
+    ],
+    parameters: CronSavedCopyParams,
+    async execute(_id, input) {
+      runtime.assertSavedMutationAllowed();
+      const source = selectJobFromService(
+        runtime.requireService(),
+        input.selector,
+      );
+      const definition = await runtime
+        .requireSavedService()
+        .copy(source, input.name, { approvalMode: "automatic" });
+      return savedToolResult(
+        `Saved ${definition.name} (${definition.id}); it is stopped`,
+        definition,
+      );
+    },
+    renderCall: (args, theme) =>
+      new Text(theme.fg("toolTitle", `cron_saved_copy ${args.selector}`), 0, 0),
+    renderResult: renderSavedMutationResult,
+  });
+
+  pi.registerTool({
+    name: "cron_saved_list",
+    label: "Cron Saved List",
+    description: "List stopped project-saved cron definitions.",
+    promptSnippet: "List reusable saved cron definitions for this project",
+    promptGuidelines: [
+      "Use cron_saved_list before ambiguous update, delete, or start operations; listed definitions remain stopped.",
+    ],
+    parameters: CronSavedListParams,
+    async execute() {
+      const definitions = await runtime.requireSavedService().list();
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: formatSavedDefinitionList(definitions),
+          },
+        ],
+        details: { action: "saved_list", definitions },
+      };
+    },
+    renderResult: renderCronResult,
+  });
+
+  pi.registerTool({
+    name: "cron_saved_update",
+    label: "Cron Saved Update",
+    description:
+      "Update one stopped project-saved cron definition without changing an active copy.",
+    promptSnippet: "Update reusable saved cron configuration",
+    promptGuidelines: [
+      "Use cron_saved_list before cron_saved_update when the selector is ambiguous; updating keeps the definition stopped.",
+    ],
+    parameters: CronSavedUpdateParams,
+    async execute(_id, input, _signal, _update, ctx) {
+      runtime.assertSavedMutationAllowed();
+      const savedService = runtime.requireSavedService();
+      const current = await savedService.select(input.selector);
+      if (input.timezone !== undefined && !hasSchedule(input)) {
+        throw new Error(
+          "cron_saved_update timezone requires a cron schedule change",
+        );
+      }
+      const editable = patchFromTool(input, current);
+      const now = new Date();
+      const patch = buildJobPatch(pi, ctx, editable, now, input.timezone, {
+        execution: current.execution,
+      });
+      if (Object.keys(patch).length === 0) {
+        throw new Error(
+          "cron_saved_update requires at least one field to change",
+        );
+      }
+      const definition = await savedService.replace(
+        current.id,
+        savedPatchFromJobPatch(patch, now),
+        { approvalMode: "automatic" },
+      );
+      return savedToolResult(
+        `Updated saved definition ${definition.name} (${definition.id})`,
+        definition,
+      );
+    },
+    renderCall: (args, theme, context) =>
+      renderMutationCall(
+        `cron_saved_update ${args.selector}`,
+        args,
+        "update",
+        context.expanded,
+        theme,
+      ),
+    renderResult: renderSavedMutationResult,
+  });
+
+  pi.registerTool({
+    name: "cron_saved_delete",
+    label: "Cron Saved Delete",
+    description:
+      "Delete one stopped project-saved cron definition without stopping active copies.",
+    promptSnippet: "Delete one reusable saved cron definition",
+    promptGuidelines: [
+      "Use cron_saved_list before cron_saved_delete when the selector is ambiguous; deletion does not mutate an active session copy.",
+    ],
+    parameters: CronSavedDeleteParams,
+    async execute(_id, input) {
+      runtime.assertSavedMutationAllowed();
+      const savedService = runtime.requireSavedService();
+      const definition = await savedService.select(input.selector);
+      await savedService.delete(definition.id);
+      return savedToolResult(
+        `Deleted saved definition ${definition.name}`,
+        definition,
+      );
+    },
+    renderCall: (args, theme) =>
+      new Text(
+        theme.fg("toolTitle", `cron_saved_delete ${args.selector}`),
+        0,
+        0,
+      ),
+    renderResult: renderSavedMutationResult,
+  });
+
+  pi.registerTool({
+    name: "cron_saved_start",
+    label: "Cron Saved Start",
+    description:
+      "Start a fresh activation of one saved definition in the current session only.",
+    promptSnippet: "Activate one saved cron in this session",
+    promptGuidelines: [
+      "Use cron_saved_list before cron_saved_start when the selector is ambiguous; activation runs only in the current session and remains stopped after restoration until explicitly restarted.",
+    ],
+    parameters: CronSavedStartParams,
+    async execute(_id, input) {
+      const job = await runtime.startSaved(input.selector, "automatic");
+      return toolResult(`Started ${job.name} (${job.id}) in this session`, job);
+    },
+    renderCall: (args, theme) =>
+      new Text(
+        theme.fg("toolTitle", `cron_saved_start ${args.selector}`),
+        0,
+        0,
+      ),
+    renderResult: renderMutationResult,
+  });
 }
 
 function creationFromTool(input: CronCreateInput): CreationFields {
@@ -248,8 +455,8 @@ function creationFromTool(input: CronCreateInput): CreationFields {
 }
 
 function patchFromTool(
-  input: CronUpdateInput,
-  current: CronJob,
+  input: CronUpdateInput | CronSavedUpdateInput,
+  current: Pick<CronJob, "execution">,
 ): EditableDraft {
   const patch: EditableDraft = {};
   if (input.name !== undefined) patch.name = input.name;
@@ -372,7 +579,24 @@ function toolResult(text: string, job: CronJob) {
   };
 }
 
-type MutationInput = Partial<CronCreateInput & CronUpdateInput>;
+function savedToolResult(text: string, definition: SavedCronDefinition) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: `${text}\n${formatSavedDefinition(definition)}`,
+      },
+    ],
+    details: { action: "saved_definition", definition },
+  };
+}
+
+type MutationInput = Partial<
+  CronCreateInput &
+    CronUpdateInput &
+    CronSavedCreateInput &
+    CronSavedUpdateInput
+>;
 
 function renderMutationCall(
   title: string,
@@ -466,6 +690,26 @@ function renderMutationResult(
   const job = result.details?.job;
   const text = job
     ? `${firstLine} · ${formatJobConfiguration(job)}`
+    : firstLine;
+  return new Text(theme.fg("muted", text), 0, 0);
+}
+
+function renderSavedMutationResult(
+  result: {
+    content: Array<{ type: string; text?: string }>;
+    details?: { definition?: SavedCronDefinition };
+  },
+  options: { expanded: boolean },
+  theme: { fg(color: string, value: string): string },
+): Text {
+  const first = result.content[0];
+  const fullText = first?.type === "text" ? (first.text ?? "") : "";
+  if (options.expanded) return new Text(theme.fg("muted", fullText), 0, 0);
+
+  const firstLine = fullText.split("\n")[0] ?? "";
+  const definition = result.details?.definition;
+  const text = definition
+    ? `${firstLine} · ${formatSavedDefinitionList([definition])}`
     : firstLine;
   return new Text(theme.fg("muted", text), 0, 0);
 }

@@ -396,6 +396,12 @@ describe("extension factory", () => {
       "cron_delete",
       "cron_run",
       "cron_wakeup",
+      "cron_saved_create",
+      "cron_saved_copy",
+      "cron_saved_list",
+      "cron_saved_update",
+      "cron_saved_delete",
+      "cron_saved_start",
     ]);
     expect(renderers).toEqual(["pi-cron/run", "pi-cron/result"]);
     expect(handlers).toEqual([
