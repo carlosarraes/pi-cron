@@ -75,9 +75,8 @@ export function savedPatchFromJobPatch(
   if (Object.hasOwn(patch, "tokenBudget")) {
     result.tokenBudget = patch.tokenBudget;
   }
-  if (Object.hasOwn(patch, "unsafeSeconds")) {
-    result.unsafeSeconds =
-      result.unsafeSeconds === true || patch.unsafeSeconds === true;
+  if (Object.hasOwn(patch, "unsafeSeconds") && result.unsafeSeconds !== true) {
+    result.unsafeSeconds = patch.unsafeSeconds;
   }
   return result;
 }

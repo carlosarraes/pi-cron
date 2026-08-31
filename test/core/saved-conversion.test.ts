@@ -308,16 +308,39 @@ describe("saved patch conversion", () => {
     expect(savedPatchFromJobPatch({}, new Date(NOW))).toEqual({});
   });
 
+  it("preserves explicit unsafe-seconds patch values", () => {
+    expect(
+      savedPatchFromJobPatch({ unsafeSeconds: undefined }, new Date(NOW)),
+    ).toEqual({ unsafeSeconds: undefined });
+    expect(
+      savedPatchFromJobPatch({ unsafeSeconds: false }, new Date(NOW)),
+    ).toEqual({ unsafeSeconds: false });
+  });
+
   it("derives unsafe seconds from sub-minute recurring schedule patches", () => {
+    const interval = {
+      kind: "interval" as const,
+      intervalMs: 30_000,
+      anchorAt: OLD,
+    };
+    expect(
+      savedPatchFromJobPatch({ schedule: interval }, new Date(NOW)),
+    ).toEqual({
+      schedule: { kind: "interval", intervalMs: 30_000 },
+      unsafeSeconds: true,
+    });
     expect(
       savedPatchFromJobPatch(
-        {
-          schedule: {
-            kind: "interval",
-            intervalMs: 30_000,
-            anchorAt: OLD,
-          },
-        },
+        { schedule: interval, unsafeSeconds: undefined },
+        new Date(NOW),
+      ),
+    ).toEqual({
+      schedule: { kind: "interval", intervalMs: 30_000 },
+      unsafeSeconds: true,
+    });
+    expect(
+      savedPatchFromJobPatch(
+        { schedule: interval, unsafeSeconds: false },
         new Date(NOW),
       ),
     ).toEqual({
