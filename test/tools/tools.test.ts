@@ -256,6 +256,15 @@ describe("cron tool schemas", () => {
       }),
     ).toBe(false);
     expect(Value.Check(CronSavedCopyParams, {})).toBe(false);
+    expect(Value.Check(CronSavedUpdateParams, {})).toBe(false);
+    expect(Value.Check(CronSavedDeleteParams, {})).toBe(false);
+    expect(Value.Check(CronSavedStartParams, {})).toBe(false);
+    expect(
+      Value.Check(CronSavedUpdateParams, {
+        selector: "template",
+        overlap: "later",
+      }),
+    ).toBe(false);
     expect(
       Value.Check(CronSavedCopyParams, {
         selector: "job",
@@ -733,6 +742,9 @@ describe("registerCronTools", () => {
     expect(savedService.list).toHaveBeenCalledOnce();
     expect(assertSavedMutationAllowed).not.toHaveBeenCalled();
     expect(result.content[0].text).toContain("save1234  stopped");
+    expect(result.content[0].text).toContain("every 300000ms");
+    expect(result.content[0].text).toContain("exec=main resources=inherited");
+    expect(result.content[0].text).toContain("overlap=queue");
     expect(result.content[0].text).not.toContain("Saved secret");
   });
 
@@ -759,8 +771,17 @@ describe("registerCronTools", () => {
     expect(assertSavedMutationAllowed).toHaveBeenCalledTimes(2);
   });
 
-  it("starts a saved definition in the current session with automatic approval", async () => {
+  it("starts a fresh saved activation in the current session with automatic approval", async () => {
     const { tools, startSaved, assertSavedMutationAllowed, ctx } = setup();
+    startSaved.mockResolvedValue({
+      ...job(),
+      savedDefinitionId: "save1234",
+      state: "active",
+      runCount: 0,
+      attributedTokens: 0,
+      consecutiveFailures: 0,
+      skippedRuns: 0,
+    });
 
     const result = await execute(
       tools.get("cron_saved_start"),
@@ -773,9 +794,78 @@ describe("registerCronTools", () => {
     expect(result.content[0].text).toContain("Started Report (job-1)");
     expect(result.details).toEqual(
       expect.objectContaining({
-        job: expect.objectContaining({ savedDefinitionId: "save1234" }),
+        job: expect.objectContaining({
+          savedDefinitionId: "save1234",
+          state: "active",
+          runCount: 0,
+          attributedTokens: 0,
+          consecutiveFailures: 0,
+          skippedRuns: 0,
+          schedule: { kind: "interval", intervalMs: 60_000, anchorAt: NOW },
+        }),
       }),
     );
+  });
+
+  it("rejects every saved catalog mutation when a scheduled run is active", async () => {
+    const configured = setup();
+    configured.assertSavedMutationAllowed.mockImplementation(() => {
+      throw new Error("Scheduled runs cannot mutate saved cron definitions");
+    });
+    const cases: Array<{
+      tool: string;
+      input: Record<string, unknown>;
+      mutation: unknown;
+    }> = [
+      {
+        tool: "cron_saved_create",
+        input: { prompt: "x", every: "5m" },
+        mutation: configured.savedService.create,
+      },
+      {
+        tool: "cron_saved_copy",
+        input: { selector: "job-1" },
+        mutation: configured.savedService.copy,
+      },
+      {
+        tool: "cron_saved_update",
+        input: { selector: "saved", overlap: "skip" },
+        mutation: configured.savedService.replace,
+      },
+      {
+        tool: "cron_saved_delete",
+        input: { selector: "saved" },
+        mutation: configured.savedService.delete,
+      },
+    ];
+
+    for (const testCase of cases) {
+      await expect(
+        execute(
+          configured.tools.get(testCase.tool),
+          testCase.input,
+          configured.ctx,
+        ),
+      ).rejects.toThrow("cannot mutate saved cron definitions");
+      expect(testCase.mutation).not.toHaveBeenCalled();
+    }
+    expect(configured.assertSavedMutationAllowed).toHaveBeenCalledTimes(4);
+  });
+
+  it("propagates recursive saved-start rejection", async () => {
+    const configured = setup();
+    configured.startSaved.mockRejectedValue(
+      new Error("Scheduled runs cannot mutate saved cron definitions"),
+    );
+
+    await expect(
+      execute(
+        configured.tools.get("cron_saved_start"),
+        { selector: "saved" },
+        configured.ctx,
+      ),
+    ).rejects.toThrow("cannot mutate saved cron definitions");
+    expect(configured.startSaved).toHaveBeenCalledWith("saved", "automatic");
   });
 
   it("rejects invalid saved schedules before catalog mutation", async () => {
@@ -854,6 +944,10 @@ describe("registerCronTools", () => {
     expect(expandedCall).toContain("secret prompt");
     expect(collapsedResult).toContain("save1234  stopped");
     expect(collapsedResult).not.toContain("Saved secret");
+    expect(collapsedUpdate).toContain("every 2h");
+    expect(collapsedUpdate).toContain("overlap unchanged");
+    expect(collapsedUpdate).toContain("mode unchanged");
+    expect(collapsedUpdate).toContain("tools unchanged");
     expect(collapsedUpdate).not.toContain("new secret");
   });
 
