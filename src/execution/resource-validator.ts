@@ -73,6 +73,19 @@ export async function validateActivationResources(options: {
   await loader.reload();
 
   const skillsResult = loader.getSkills();
+  const skillErrors = skillsResult.diagnostics.filter(
+    (diagnostic) => diagnostic.type === "error",
+  );
+  if (skillErrors.length > 0) {
+    const detail = skillErrors
+      .map((diagnostic) =>
+        diagnostic.path
+          ? `${diagnostic.path}: ${diagnostic.message}`
+          : diagnostic.message,
+      )
+      .join("; ");
+    throw new Error(`Isolated skill loading failed: ${detail}`);
+  }
   const availableSkills = new Set(
     skillsResult.skills.map((skill) => skill.name),
   );

@@ -30,6 +30,7 @@ function setup(
     tools?: string[];
     models?: Model<Api>[];
     skills?: string[];
+    skillErrors?: Array<{ path: string; error: string }>;
     extensions?: string[];
     errors?: Array<{ path: string; error: string }>;
   } = {},
@@ -48,7 +49,11 @@ function setup(
     reload: vi.fn(async () => undefined),
     getSkills: () => ({
       skills: (overrides.skills ?? ["review"]).map((name) => ({ name })),
-      errors: [],
+      diagnostics: (overrides.skillErrors ?? []).map(({ path, error }) => ({
+        type: "error" as const,
+        path,
+        message: error,
+      })),
     }),
     getExtensions: () => ({
       extensions: (overrides.extensions ?? ["/tmp/safe-ext.ts"]).map(
@@ -130,6 +135,14 @@ describe("validateActivationResources", () => {
     await expect(
       validateActivationResources({ ...base, ...setup({ skills: [] }) }),
     ).rejects.toThrow("skills unavailable");
+    await expect(
+      validateActivationResources({
+        ...base,
+        ...setup({
+          skillErrors: [{ path: "/bad-skill", error: "skill boom" }],
+        }),
+      }),
+    ).rejects.toThrow("Isolated skill loading failed: /bad-skill: skill boom");
     await expect(
       validateActivationResources({ ...base, ...setup({ extensions: [] }) }),
     ).rejects.toThrow("extensions unavailable");
