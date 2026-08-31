@@ -7,7 +7,9 @@ import {
   type CronRuntimeRef,
   registerCronCommand,
 } from "../../src/commands/register.js";
+import type { SavedCronService } from "../../src/core/saved-service.js";
 import type { CronService, JobDraft } from "../../src/core/service.js";
+import type { SavedCronDefinition } from "../../src/domain/saved.js";
 import type { CronJob } from "../../src/domain/types.js";
 
 const NOW = "2026-07-15T10:00:00.000Z";
@@ -33,8 +35,32 @@ function job(overrides: Partial<CronJob> = {}): CronJob {
   };
 }
 
-function setup(wizardResult?: JobDraft) {
+function savedDefinition(
+  overrides: Partial<SavedCronDefinition> = {},
+): SavedCronDefinition {
+  return {
+    version: 1,
+    id: "save-001",
+    name: "Saved report",
+    prompt: { kind: "text", text: "TOP SECRET saved prompt" },
+    schedule: { kind: "interval", intervalMs: 300_000 },
+    execution: { kind: "main" },
+    overlap: "queue",
+    unsafeSeconds: false,
+    expiresAfterMs: 604_800_000,
+    createdAt: NOW,
+    updatedAt: NOW,
+    approval: { approvedAt: NOW, fingerprint: "saved-ok" },
+    ...overrides,
+  };
+}
+
+function setup(
+  wizardResult?: JobDraft,
+  savedOverrides: Partial<SavedCronDefinition> = {},
+) {
   const current = job();
+  const saved = savedDefinition(savedOverrides);
   const service = {
     list: vi.fn(() => [current]),
     get: vi.fn((id: string) => (id === current.id ? current : undefined)),
@@ -44,12 +70,25 @@ function setup(wizardResult?: JobDraft) {
     resume: vi.fn(async () => current),
     delete: vi.fn(async () => undefined),
   } as unknown as CronService;
+  const savedService = {
+    list: vi.fn(async () => [saved]),
+    select: vi.fn(async () => saved),
+    create: vi.fn(async () => saved),
+    copy: vi.fn(async () => saved),
+    replace: vi.fn(async () => saved),
+    delete: vi.fn(async () => undefined),
+  } as unknown as SavedCronService;
   const manager = vi.fn(async () => undefined);
   const wizard = vi.fn(async () => wizardResult);
   const runNow = vi.fn(async () => undefined);
   const stopAll = vi.fn(async () => undefined);
+  const assertSavedMutationAllowed = vi.fn();
+  const startSaved = vi.fn(async () => current);
   const runtime: CronRuntimeRef = {
     requireService: () => service,
+    requireSavedService: () => savedService,
+    assertSavedMutationAllowed,
+    startSaved,
     getScheduler: () => ({
       runNow,
       getRuntimeStatus: () => ({ state: "idle" }),
@@ -87,6 +126,10 @@ function setup(wizardResult?: JobDraft) {
   return {
     run: (args: string) => (handler as NonNullable<typeof handler>)(args, ctx),
     service,
+    savedService,
+    saved,
+    assertSavedMutationAllowed,
+    startSaved,
     manager,
     wizard,
     runNow,
@@ -199,6 +242,76 @@ describe("registerCronCommand", () => {
     expect(configured.service.resume).toHaveBeenCalled();
     expect(configured.runNow).toHaveBeenCalledWith("job-1");
     expect(configured.service.delete).toHaveBeenCalledWith("job-1");
+  });
+
+  it("creates, copies, lists, shows, edits, deletes, and starts saved definitions", async () => {
+    const configured = setup(undefined, {
+      execution: {
+        kind: "isolated",
+        model: "openai/model-a",
+        effort: "medium",
+        tools: ["read"],
+        skills: ["review"],
+        extensions: ["github"],
+        notify: false,
+        timeoutMs: 60_000,
+      },
+    });
+
+    await configured.run(
+      'save add --every 1h --prompt "saved work" --name reusable',
+    );
+    expect(configured.assertSavedMutationAllowed).toHaveBeenCalledTimes(1);
+    expect(configured.savedService.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "reusable",
+        prompt: { kind: "text", text: "saved work" },
+        schedule: { kind: "interval", intervalMs: 3_600_000 },
+      }),
+    );
+
+    await configured.run("save Report --name copied-report");
+    expect(configured.savedService.copy).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "job-1" }),
+      "copied-report",
+    );
+
+    await configured.run("saved");
+    expect(configured.notifications.at(-1)).toContain("stopped");
+    expect(configured.notifications.at(-1)).not.toContain("TOP SECRET");
+
+    await configured.run("saved show save-001");
+    expect(configured.savedService.select).toHaveBeenCalledWith("save-001");
+    expect(configured.notifications.at(-1)).toContain(
+      "TOP SECRET saved prompt",
+    );
+
+    await configured.run("saved edit save-001 --isolated --effort high");
+    expect(configured.savedService.replace).toHaveBeenCalledWith(
+      "save-001",
+      expect.objectContaining({
+        execution: expect.objectContaining({
+          kind: "isolated",
+          effort: "high",
+          tools: ["read"],
+          skills: ["review"],
+          extensions: ["github"],
+        }),
+      }),
+    );
+
+    await configured.run("saved delete save-001");
+    expect(configured.savedService.delete).toHaveBeenCalledWith("save-001");
+    expect(configured.assertSavedMutationAllowed).toHaveBeenCalledTimes(4);
+
+    await configured.run("start save-001");
+    expect(configured.startSaved).toHaveBeenCalledWith(
+      "save-001",
+      "interactive",
+    );
+    expect(configured.notifications.at(-1)).toBe(
+      "Started Report (job-1) in this session",
+    );
   });
 
   it("stops runtime activity and pauses every active job", async () => {

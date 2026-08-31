@@ -149,6 +149,39 @@ describe("parseCronCommand", () => {
     );
   });
 
+  it("parses saved definition commands", () => {
+    expect(parseCronCommand('save add --every 1h --prompt "do X"')).toEqual({
+      kind: "saved_create",
+      input: {
+        schedule: { kind: "interval", value: "1h" },
+        prompt: "do X",
+      },
+    });
+    expect(parseCronCommand("save report --name reusable-report")).toEqual({
+      kind: "saved_copy",
+      selector: "report",
+      name: "reusable-report",
+    });
+    expect(parseCronCommand("saved")).toEqual({ kind: "saved_list" });
+    expect(parseCronCommand("saved show report")).toEqual({
+      kind: "saved_show",
+      selector: "report",
+    });
+    expect(parseCronCommand("saved edit report --overlap skip")).toEqual({
+      kind: "saved_edit",
+      selector: "report",
+      patch: { overlap: "skip" },
+    });
+    expect(parseCronCommand("saved delete report")).toEqual({
+      kind: "saved_delete",
+      selector: "report",
+    });
+    expect(parseCronCommand("start report")).toEqual({
+      kind: "saved_start",
+      selector: "report",
+    });
+  });
+
   it("parses management commands", () => {
     expect(parseCronCommand("list")).toEqual({ kind: "list" });
     for (const kind of ["show", "pause", "resume", "run", "delete"] as const) {
@@ -207,6 +240,19 @@ describe("parseCronCommand", () => {
     ["stop job-1", /Usage/],
     ["edit job-1", /at least one field/],
     ['edit "" --prompt work', /Usage/],
+    ["save", /Usage/],
+    ["save add --prompt work", /exactly one schedule/],
+    ["save add --adaptive", /--prompt/],
+    ["save report extra", /Unexpected argument/],
+    ["save report --overlap skip", /only --name/],
+    ["save report --name one --name two", /Duplicate flag/],
+    ["saved show", /Usage/],
+    ["saved show one two", /Usage/],
+    ["saved edit report", /at least one field/],
+    ["saved delete", /Usage/],
+    ["saved unknown report", /Usage/],
+    ["start", /Usage/],
+    ["start one two", /Usage/],
   ])("rejects malformed input: %s", (raw, message) => {
     expect(() => parseCronCommand(raw)).toThrowError(message);
   });

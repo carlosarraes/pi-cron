@@ -3,15 +3,22 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import {
+  savedDraftFromJobDraft,
+  savedPatchFromJobPatch,
+} from "../core/saved-conversion.js";
+import type { SavedCronService } from "../core/saved-service.js";
 import type { Scheduler } from "../core/scheduler.js";
 import type { CronService, JobDraft, JobPatch } from "../core/service.js";
 import { selectJob } from "../domain/policy.js";
+import type { SavedCronDefinition, SavedSchedule } from "../domain/saved.js";
 import {
   describeSchedule,
   parseDuration,
   resolveSchedule,
 } from "../domain/schedule.js";
 import {
+  type ApprovalMode,
   type CronJob,
   DEFAULT_LIMITS,
   type ExecutionMode,
@@ -27,7 +34,10 @@ import {
 
 export interface CronRuntimeRef {
   requireService(): CronService;
+  requireSavedService?(): SavedCronService;
   assertWritable?(): void;
+  assertSavedMutationAllowed?(): void;
+  startSaved?(selector: string, approvalMode?: ApprovalMode): Promise<CronJob>;
   getScheduler(): Pick<Scheduler, "runNow" | "getRuntimeStatus"> | undefined;
   getMainExecutor(): Pick<MainExecutor, "applyWakeup"> | undefined;
   runManager(ctx: ExtensionCommandContext): Promise<void>;
@@ -56,7 +66,8 @@ export function registerCronCommand(
   runtime: CronRuntimeRef,
 ): void {
   pi.registerCommand("cron", {
-    description: "Create and manage session-scoped scheduled prompts",
+    description:
+      "Create and manage session jobs and project-saved cron definitions",
     getArgumentCompletions: (prefix) =>
       [
         "add",
@@ -68,6 +79,12 @@ export function registerCronCommand(
         "edit",
         "delete",
         "stop --all",
+        "save add",
+        "saved",
+        "saved show",
+        "saved edit",
+        "saved delete",
+        "start",
       ]
         .filter((value) => value.startsWith(prefix))
         .map((value) => ({ value, label: value })),
@@ -119,6 +136,73 @@ async function dispatchCronIntent(
       const draft = buildJobDraft(pi, ctx, fromCreateInput(intent.input));
       const created = await service.create(draft);
       notify(ctx, `Created ${created.name} (${created.id})`);
+      return;
+    }
+    case "saved_create": {
+      runtime.assertSavedMutationAllowed?.();
+      const now = new Date();
+      const jobDraft = buildJobDraft(
+        pi,
+        ctx,
+        fromCreateInput(intent.input),
+        now,
+      );
+      const saved = await requireSavedService(runtime).create(
+        savedDraftFromJobDraft(jobDraft, now),
+      );
+      notify(ctx, `Saved ${saved.name} (${saved.id}); it is stopped`);
+      return;
+    }
+    case "saved_copy": {
+      runtime.assertSavedMutationAllowed?.();
+      const source = selectJobFromService(service, intent.selector);
+      const saved = await requireSavedService(runtime).copy(
+        source,
+        intent.name,
+      );
+      notify(ctx, `Saved ${saved.name} (${saved.id}); it is stopped`);
+      return;
+    }
+    case "saved_list":
+      notify(
+        ctx,
+        formatSavedDefinitionList(await requireSavedService(runtime).list()),
+      );
+      return;
+    case "saved_show": {
+      const saved = await requireSavedService(runtime).select(intent.selector);
+      notify(ctx, formatSavedDefinition(saved));
+      return;
+    }
+    case "saved_edit": {
+      runtime.assertSavedMutationAllowed?.();
+      const savedService = requireSavedService(runtime);
+      const current = await savedService.select(intent.selector);
+      const now = new Date();
+      const jobPatch = buildJobPatch(pi, ctx, intent.patch, now, undefined, {
+        execution: current.execution,
+      });
+      const saved = await savedService.replace(
+        current.id,
+        savedPatchFromJobPatch(jobPatch, now),
+      );
+      notify(ctx, `Updated saved definition ${saved.name}`);
+      return;
+    }
+    case "saved_delete": {
+      runtime.assertSavedMutationAllowed?.();
+      const savedService = requireSavedService(runtime);
+      const saved = await savedService.select(intent.selector);
+      await savedService.delete(saved.id);
+      notify(ctx, `Deleted saved definition ${saved.name}`);
+      return;
+    }
+    case "saved_start": {
+      if (!runtime.startSaved) {
+        throw new Error("Saved cron activation is unavailable");
+      }
+      const job = await runtime.startSaved(intent.selector, "interactive");
+      notify(ctx, `Started ${job.name} (${job.id}) in this session`);
       return;
     }
     case "list":
@@ -230,7 +314,7 @@ export function buildJobPatch(
   patch: EditableDraft,
   now = new Date(),
   timezone?: string,
-  current?: CronJob,
+  current?: Pick<CronJob, "execution">,
 ): JobPatch {
   const output: JobPatch = {};
   if (patch.name !== undefined) output.name = patch.name;
@@ -355,6 +439,32 @@ function formatListExecution(job: CronJob): string {
   return `exec=isolated  model=${job.execution.model}  effort=${job.execution.effort}  tools=${tools}  skills=${skills}  extensions=${extensions}  notify=${notify}  timeout=${job.execution.timeoutMs}ms`;
 }
 
+export function formatSavedDefinitionList(
+  definitions: SavedCronDefinition[],
+): string {
+  if (definitions.length === 0) return "No saved cron definitions";
+  return definitions
+    .map(
+      (definition) =>
+        `${definition.id}  stopped  ${definition.name}  ${formatSavedSchedule(definition.schedule)}  ${formatSavedExecution(definition)}  overlap=${definition.overlap}  expiresAfter=${definition.expiresAfterMs}ms  maxRuns=${definition.maxRuns ?? "unbounded"}  budget=${definition.tokenBudget ?? "unbounded"}`,
+    )
+    .join("\n");
+}
+
+export function formatSavedDefinition(definition: SavedCronDefinition): string {
+  return [
+    `${definition.name} (${definition.id})`,
+    "State: stopped (saved definition)",
+    `Prompt: ${formatSavedPrompt(definition)}`,
+    `Schedule: ${formatSavedSchedule(definition.schedule)}`,
+    `Execution: ${formatSavedExecution(definition)}`,
+    `Overlap: ${definition.overlap}`,
+    `Expires after: ${definition.expiresAfterMs}ms`,
+    `Maximum runs: ${definition.maxRuns ?? "unbounded"}`,
+    `Token budget: ${definition.tokenBudget ?? "unbounded"}`,
+  ].join("\n");
+}
+
 export function formatJob(job: CronJob): string {
   return [
     `${job.name} (${job.id})`,
@@ -367,6 +477,46 @@ export function formatJob(job: CronJob): string {
     `Last skipped: ${job.lastSkippedAt ?? "never"}`,
     `Expires: ${job.expiresAt}`,
   ].join("\n");
+}
+
+function requireSavedService(runtime: CronRuntimeRef): SavedCronService {
+  if (!runtime.requireSavedService) {
+    throw new Error("Saved cron definitions are unavailable");
+  }
+  return runtime.requireSavedService();
+}
+
+function formatSavedSchedule(schedule: SavedSchedule): string {
+  switch (schedule.kind) {
+    case "interval":
+      return `every ${schedule.intervalMs}ms`;
+    case "cron":
+      return `${schedule.expression} (${schedule.timezone})`;
+    case "once":
+      return schedule.timing.kind === "relative"
+        ? `once after ${schedule.timing.delayMs}ms`
+        : `once at ${schedule.timing.at}`;
+    case "adaptive":
+      return "adaptive";
+    case "maintenance":
+      return schedule.cadence === "adaptive"
+        ? "maintenance (adaptive)"
+        : `maintenance every ${schedule.cadence.intervalMs}ms`;
+  }
+}
+
+function formatSavedExecution(definition: SavedCronDefinition): string {
+  if (definition.execution.kind === "main")
+    return "exec=main resources=inherited";
+  const execution = definition.execution;
+  return `exec=isolated model=${execution.model} effort=${execution.effort} tools=${execution.tools.join(",") || "none"} skills=${execution.skills.join(",") || "none"} extensions=${execution.extensions.join(",") || "none"} notify=${execution.notify ? "on" : "off"} timeout=${execution.timeoutMs}ms`;
+}
+
+function formatSavedPrompt(definition: SavedCronDefinition): string {
+  const prompt = definition.prompt;
+  if (prompt.kind === "text") return prompt.text;
+  if (prompt.kind === "maintenance") return "maintenance";
+  return `/${prompt.name}${prompt.args ? ` ${prompt.args}` : ""} (${prompt.source})`;
 }
 
 function notify(ctx: ExtensionContext, message: string): void {

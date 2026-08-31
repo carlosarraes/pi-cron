@@ -86,8 +86,14 @@ export type CommandIntent =
   | { kind: "manager" }
   | { kind: "guided_add" }
   | { kind: "maintenance"; interval: string | undefined }
-  | { kind: "create"; input: CreateInput }
-  | { kind: "list" }
+  | { kind: "create" | "saved_create"; input: CreateInput }
+  | { kind: "list" | "saved_list" }
+  | { kind: "saved_copy"; selector: string; name?: string }
+  | {
+      kind: "saved_show" | "saved_delete" | "saved_start";
+      selector: string;
+    }
+  | { kind: "saved_edit"; selector: string; patch: EditableDraft }
   | {
       kind: "show" | "pause" | "resume" | "run" | "delete";
       selector: string;
@@ -137,6 +143,12 @@ export function parseCronCommand(raw: string): CommandIntent {
     return remainder === ""
       ? { kind: "guided_add" }
       : parseStrictAdd(tokenize(remainder));
+  }
+  if (first === "save") return parseSave(tokenize(remainder));
+  if (first === "saved") return parseSaved(tokenize(remainder));
+  if (first === "start") {
+    const command = parseSelectorCommand("start", tokenize(remainder));
+    return { kind: "saved_start", selector: command.selector };
   }
 
   if (first === "list") return parseList(tokenize(remainder));
@@ -247,7 +259,10 @@ function parseFlags(tokens: string[]): ParsedFlags {
   return flags;
 }
 
-function parseStrictAdd(tokens: string[]): CommandIntent {
+function parseStrictAdd(
+  tokens: string[],
+  saved = false,
+): Extract<CommandIntent, { kind: "create" | "saved_create" }> {
   const flags = parseFlags(tokens);
   const schedule = scheduleFrom(flags, true);
   const prompt = stringFlag(flags, "--prompt");
@@ -255,14 +270,19 @@ function parseStrictAdd(tokens: string[]): CommandIntent {
     throw new CommandParseError("add requires --prompt");
   }
   return {
-    kind: "create",
+    kind: saved ? "saved_create" : "create",
     input: { schedule: schedule as ScheduleInput, prompt, ...draftFrom(flags) },
   };
 }
 
-function parseEdit(tokens: string[]): CommandIntent {
+function parseEdit(
+  tokens: string[],
+  saved = false,
+): Extract<CommandIntent, { kind: "edit" | "saved_edit" }> {
   if (tokens.length === 0 || tokens[0] === "" || tokens[0].startsWith("--")) {
-    throw new CommandParseError("Usage: /cron edit <selector> [flags]");
+    throw new CommandParseError(
+      `Usage: /cron ${saved ? "saved edit" : "edit"} <selector> [flags]`,
+    );
   }
   const selector = tokens[0];
   const flags = parseFlags(tokens.slice(1));
@@ -274,7 +294,44 @@ function parseEdit(tokens: string[]): CommandIntent {
   if (Object.keys(patch).length === 0) {
     throw new CommandParseError("edit requires at least one field to change");
   }
-  return { kind: "edit", selector, patch };
+  return { kind: saved ? "saved_edit" : "edit", selector, patch };
+}
+
+function parseSave(tokens: string[]): CommandIntent {
+  if (tokens.length === 0 || tokens[0] === "") {
+    throw new CommandParseError(
+      "Usage: /cron save add [flags] | /cron save <selector> [--name <name>]",
+    );
+  }
+  if (tokens[0] === "add") return parseStrictAdd(tokens.slice(1), true);
+  if (tokens[0].startsWith("--")) {
+    throw new CommandParseError("Usage: /cron save <selector> [--name <name>]");
+  }
+  const selector = tokens[0];
+  const flags = parseFlags(tokens.slice(1));
+  if ([...flags.keys()].some((flag) => flag !== "--name")) {
+    throw new CommandParseError("save copy accepts only --name");
+  }
+  const name = stringFlag(flags, "--name");
+  return name === undefined
+    ? { kind: "saved_copy", selector }
+    : { kind: "saved_copy", selector, name };
+}
+
+function parseSaved(tokens: string[]): CommandIntent {
+  if (tokens.length === 0) return { kind: "saved_list" };
+  const operation = tokens[0];
+  if (operation === "edit") return parseEdit(tokens.slice(1), true);
+  if (operation === "show" || operation === "delete") {
+    const command = parseSelectorCommand(`saved ${operation}`, tokens.slice(1));
+    return {
+      kind: operation === "show" ? "saved_show" : "saved_delete",
+      selector: command.selector,
+    };
+  }
+  throw new CommandParseError(
+    "Usage: /cron saved [show <selector> | edit <selector> [flags] | delete <selector>]",
+  );
 }
 
 function scheduleFrom(
@@ -396,10 +453,17 @@ function parseList(tokens: string[]): CommandIntent {
   return { kind: "list" };
 }
 
-function parseSelectorCommand(
-  kind: "show" | "pause" | "resume" | "run" | "delete",
-  tokens: string[],
-): CommandIntent {
+function parseSelectorCommand<
+  K extends
+    | "show"
+    | "pause"
+    | "resume"
+    | "run"
+    | "delete"
+    | "start"
+    | "saved show"
+    | "saved delete",
+>(kind: K, tokens: string[]): { kind: K; selector: string } {
   if (tokens.length !== 1 || tokens[0] === "") {
     throw new CommandParseError(`Usage: /cron ${kind} <selector>`);
   }
