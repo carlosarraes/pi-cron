@@ -62,6 +62,7 @@ export function savedPatchFromJobPatch(
   }
   if (Object.hasOwn(patch, "schedule") && patch.schedule !== undefined) {
     result.schedule = savedScheduleFromRuntime(patch.schedule);
+    if (isSubMinuteRecurring(patch.schedule)) result.unsafeSeconds = true;
   }
   if (Object.hasOwn(patch, "execution") && patch.execution !== undefined) {
     result.execution = structuredClone(patch.execution);
@@ -75,7 +76,8 @@ export function savedPatchFromJobPatch(
     result.tokenBudget = patch.tokenBudget;
   }
   if (Object.hasOwn(patch, "unsafeSeconds")) {
-    result.unsafeSeconds = patch.unsafeSeconds;
+    result.unsafeSeconds =
+      result.unsafeSeconds === true || patch.unsafeSeconds === true;
   }
   return result;
 }

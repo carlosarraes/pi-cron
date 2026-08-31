@@ -307,4 +307,36 @@ describe("saved patch conversion", () => {
     });
     expect(savedPatchFromJobPatch({}, new Date(NOW))).toEqual({});
   });
+
+  it("derives unsafe seconds from sub-minute recurring schedule patches", () => {
+    expect(
+      savedPatchFromJobPatch(
+        {
+          schedule: {
+            kind: "interval",
+            intervalMs: 30_000,
+            anchorAt: OLD,
+          },
+        },
+        new Date(NOW),
+      ),
+    ).toEqual({
+      schedule: { kind: "interval", intervalMs: 30_000 },
+      unsafeSeconds: true,
+    });
+    expect(
+      savedPatchFromJobPatch(
+        {
+          schedule: {
+            kind: "maintenance",
+            cadence: { intervalMs: 30_000, anchorAt: OLD },
+          },
+        },
+        new Date(NOW),
+      ),
+    ).toEqual({
+      schedule: { kind: "maintenance", cadence: { intervalMs: 30_000 } },
+      unsafeSeconds: true,
+    });
+  });
 });

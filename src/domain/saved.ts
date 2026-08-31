@@ -8,6 +8,7 @@ import {
 
 export const SAVED_DEFINITION_VERSION = 1 as const;
 export const SAVED_CATALOG_VERSION = 1 as const;
+export const MAX_SAVED_NAME_LENGTH = 100 as const;
 
 export type SavedSchedule =
   | { kind: "interval"; intervalMs: number }
@@ -212,7 +213,9 @@ function isSavedDefinitionShape(
     typeof value.id === "string" &&
     /^[a-z0-9]{8}$/.test(value.id) &&
     typeof value.name === "string" &&
-    value.name.trim().length > 0 &&
+    value.name === value.name.trim() &&
+    value.name.length > 0 &&
+    value.name.length <= MAX_SAVED_NAME_LENGTH &&
     isPrompt(value.prompt) &&
     isSavedSchedule(value.schedule) &&
     isExecution(value.execution) &&

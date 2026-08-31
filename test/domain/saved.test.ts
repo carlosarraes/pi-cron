@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   assertSavedCatalog,
+  MAX_SAVED_NAME_LENGTH,
   requiresSavedReapproval,
   type SavedCronDefinition,
   selectSavedDefinition,
@@ -85,16 +86,28 @@ describe("saved cron catalog validation", () => {
         version: 1,
         definitions: [
           definition(),
-          definition({ id: "dcba4321", name: " daily REPORT " }),
+          definition({ id: "dcba4321", name: "DAILY REPORT" }),
         ],
       }),
     ).toThrow("Duplicate saved cron definition name");
+  });
+
+  it("accepts the maximum saved name length", () => {
+    expect(() =>
+      assertSavedCatalog({
+        version: 1,
+        definitions: [definition({ name: "x".repeat(MAX_SAVED_NAME_LENGTH) })],
+      }),
+    ).not.toThrow();
   });
 
   it("rejects invalid IDs, names, timestamps, counters, and excessive catalogs", () => {
     for (const invalid of [
       definition({ id: "ABC12345" }),
       definition({ name: "   " }),
+      definition({ name: " leading" }),
+      definition({ name: "trailing " }),
+      definition({ name: "x".repeat(MAX_SAVED_NAME_LENGTH + 1) }),
       definition({ createdAt: "yesterday" }),
       definition({ expiresAfterMs: 1.5 }),
       definition({ maxRuns: 0 }),
