@@ -34,10 +34,10 @@ import {
 
 export interface CronRuntimeRef {
   requireService(): CronService;
-  requireSavedService?(): SavedCronService;
+  requireSavedService(): SavedCronService;
   assertWritable?(): void;
-  assertSavedMutationAllowed?(): void;
-  startSaved?(selector: string, approvalMode?: ApprovalMode): Promise<CronJob>;
+  assertSavedMutationAllowed(): void;
+  startSaved(selector: string, approvalMode?: ApprovalMode): Promise<CronJob>;
   getScheduler(): Pick<Scheduler, "runNow" | "getRuntimeStatus"> | undefined;
   getMainExecutor(): Pick<MainExecutor, "applyWakeup"> | undefined;
   runManager(ctx: ExtensionCommandContext): Promise<void>;
@@ -139,7 +139,7 @@ async function dispatchCronIntent(
       return;
     }
     case "saved_create": {
-      runtime.assertSavedMutationAllowed?.();
+      runtime.assertSavedMutationAllowed();
       const now = new Date();
       const jobDraft = buildJobDraft(
         pi,
@@ -147,36 +147,35 @@ async function dispatchCronIntent(
         fromCreateInput(intent.input),
         now,
       );
-      const saved = await requireSavedService(runtime).create(
-        savedDraftFromJobDraft(jobDraft, now),
-      );
+      const saved = await runtime
+        .requireSavedService()
+        .create(savedDraftFromJobDraft(jobDraft, now));
       notify(ctx, `Saved ${saved.name} (${saved.id}); it is stopped`);
       return;
     }
     case "saved_copy": {
-      runtime.assertSavedMutationAllowed?.();
+      runtime.assertSavedMutationAllowed();
       const source = selectJobFromService(service, intent.selector);
-      const saved = await requireSavedService(runtime).copy(
-        source,
-        intent.name,
-      );
+      const saved = await runtime
+        .requireSavedService()
+        .copy(source, intent.name);
       notify(ctx, `Saved ${saved.name} (${saved.id}); it is stopped`);
       return;
     }
     case "saved_list":
       notify(
         ctx,
-        formatSavedDefinitionList(await requireSavedService(runtime).list()),
+        formatSavedDefinitionList(await runtime.requireSavedService().list()),
       );
       return;
     case "saved_show": {
-      const saved = await requireSavedService(runtime).select(intent.selector);
+      const saved = await runtime.requireSavedService().select(intent.selector);
       notify(ctx, formatSavedDefinition(saved));
       return;
     }
     case "saved_edit": {
-      runtime.assertSavedMutationAllowed?.();
-      const savedService = requireSavedService(runtime);
+      runtime.assertSavedMutationAllowed();
+      const savedService = runtime.requireSavedService();
       const current = await savedService.select(intent.selector);
       const now = new Date();
       const jobPatch = buildJobPatch(pi, ctx, intent.patch, now, undefined, {
@@ -190,17 +189,14 @@ async function dispatchCronIntent(
       return;
     }
     case "saved_delete": {
-      runtime.assertSavedMutationAllowed?.();
-      const savedService = requireSavedService(runtime);
+      runtime.assertSavedMutationAllowed();
+      const savedService = runtime.requireSavedService();
       const saved = await savedService.select(intent.selector);
       await savedService.delete(saved.id);
       notify(ctx, `Deleted saved definition ${saved.name}`);
       return;
     }
     case "saved_start": {
-      if (!runtime.startSaved) {
-        throw new Error("Saved cron activation is unavailable");
-      }
       const job = await runtime.startSaved(intent.selector, "interactive");
       notify(ctx, `Started ${job.name} (${job.id}) in this session`);
       return;
@@ -477,13 +473,6 @@ export function formatJob(job: CronJob): string {
     `Last skipped: ${job.lastSkippedAt ?? "never"}`,
     `Expires: ${job.expiresAt}`,
   ].join("\n");
-}
-
-function requireSavedService(runtime: CronRuntimeRef): SavedCronService {
-  if (!runtime.requireSavedService) {
-    throw new Error("Saved cron definitions are unavailable");
-  }
-  return runtime.requireSavedService();
 }
 
 function formatSavedSchedule(schedule: SavedSchedule): string {

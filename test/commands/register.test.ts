@@ -314,6 +314,36 @@ describe("registerCronCommand", () => {
     );
   });
 
+  it("rejects saved mutations and activation during a scheduled run", async () => {
+    for (const command of [
+      'save add --every 1h --prompt "saved work"',
+      "save Report",
+      "saved edit save-001 --overlap skip",
+      "saved delete save-001",
+    ]) {
+      const configured = setup();
+      configured.assertSavedMutationAllowed.mockImplementation(() => {
+        throw new Error("Scheduled runs cannot mutate saved cron definitions");
+      });
+
+      await expect(configured.run(command)).rejects.toThrow(
+        "Scheduled runs cannot mutate saved cron definitions",
+      );
+      expect(configured.savedService.create).not.toHaveBeenCalled();
+      expect(configured.savedService.copy).not.toHaveBeenCalled();
+      expect(configured.savedService.replace).not.toHaveBeenCalled();
+      expect(configured.savedService.delete).not.toHaveBeenCalled();
+    }
+
+    const activation = setup();
+    activation.startSaved.mockRejectedValue(
+      new Error("Scheduled runs cannot mutate saved cron definitions"),
+    );
+    await expect(activation.run("start save-001")).rejects.toThrow(
+      "Scheduled runs cannot mutate saved cron definitions",
+    );
+  });
+
   it("stops runtime activity and pauses every active job", async () => {
     const configured = setup();
     await configured.run("stop --all");

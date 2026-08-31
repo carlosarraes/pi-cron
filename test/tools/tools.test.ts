@@ -104,6 +104,13 @@ function setup(overrides: Partial<CronService> = {}) {
   const runNow = vi.fn(async () => undefined);
   const runtime: CronRuntimeRef = {
     requireService: () => service,
+    requireSavedService: () => {
+      throw new Error("Saved cron definitions are unavailable in this test");
+    },
+    assertSavedMutationAllowed: () => undefined,
+    startSaved: async () => {
+      throw new Error("Saved cron activation is unavailable in this test");
+    },
     getScheduler: () => ({
       runNow,
       getRuntimeStatus: () => ({ state: "idle" }),
