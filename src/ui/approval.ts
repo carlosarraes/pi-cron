@@ -55,6 +55,7 @@ export function fingerprintJob(job: ProposedJob): string {
     maxRuns: job.maxRuns ?? null,
     tokenBudget: job.tokenBudget ?? null,
     originSessionId: job.originSessionId,
+    savedDefinitionId: job.savedDefinitionId ?? null,
   };
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }

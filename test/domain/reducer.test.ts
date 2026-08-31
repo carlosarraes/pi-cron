@@ -289,3 +289,24 @@ describe("PiEventStore", () => {
     expect(appendEntry).toHaveBeenCalledWith("pi-cron/event", event);
   });
 });
+
+describe("saved activation provenance", () => {
+  it("replays an optional non-empty saved definition ID", () => {
+    const saved = job({ savedDefinitionId: "save1234" });
+    expect(
+      reduceEvents([created(saved)]).get(saved.id)?.savedDefinitionId,
+    ).toBe("save1234");
+  });
+
+  it("rejects empty or non-string saved definition provenance", () => {
+    const empty = created({ ...job(), savedDefinitionId: "" });
+    expect(() => reduceEvents([empty])).toThrow("Malformed pi-cron event");
+    const wrong = created(job()) as unknown as {
+      job: Record<string, unknown>;
+    };
+    wrong.job.savedDefinitionId = 7;
+    expect(() => reduceEvents([wrong as unknown as CronEvent])).toThrow(
+      "Malformed pi-cron event",
+    );
+  });
+});

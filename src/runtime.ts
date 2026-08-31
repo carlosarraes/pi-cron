@@ -12,10 +12,15 @@ import {
 import type { CronRuntimeRef } from "./commands/register.js";
 import { PiEventStore } from "./core/event-store.js";
 import { type LeaseRecord, RuntimeLease } from "./core/lease.js";
+import { ProjectCronStore } from "./core/project-cron-store.js";
+import { materializeSavedDefinition } from "./core/saved-conversion.js";
+import { SavedCronService } from "./core/saved-service.js";
 import { Scheduler } from "./core/scheduler.js";
 import { CronService, type JobDraft } from "./core/service.js";
 import { selectJob } from "./domain/policy.js";
+import type { SavedDefinitionStore } from "./domain/saved.js";
 import type {
+  ApprovalMode,
   Clock,
   CronJob,
   Dispatcher,
@@ -25,8 +30,10 @@ import { makeJobId } from "./domain/types.js";
 import { IsolatedExecutor } from "./execution/isolated-executor.js";
 import { MainExecutor } from "./execution/main-executor.js";
 import { PromptResolver } from "./execution/prompt-resolver.js";
+import { validateActivationResources } from "./execution/resource-validator.js";
 import { UiApprovalPort } from "./ui/approval.js";
 import { runCronManager } from "./ui/manager.js";
+import { UiSavedApprovalPort } from "./ui/saved-approval.js";
 import { updateCronStatus } from "./ui/status.js";
 import { runCronWizard, type WizardState } from "./ui/wizard.js";
 
@@ -55,6 +62,7 @@ export interface CronRuntimeDependencies {
   leaseFactory?: () => LeasePort;
   setInterval?: (fn: () => void, ms: number) => unknown;
   clearInterval?: (handle: unknown) => void;
+  savedStoreFactory?: (ctx: ExtensionContext) => SavedDefinitionStore;
 }
 
 export class CronRuntime implements CronRuntimeRef {
@@ -63,7 +71,11 @@ export class CronRuntime implements CronRuntimeRef {
   private readonly leaseFactory: () => LeasePort;
   private readonly setIntervalFn: (fn: () => void, ms: number) => unknown;
   private readonly clearIntervalFn: (handle: unknown) => void;
+  private readonly savedStoreFactory: (
+    ctx: ExtensionContext,
+  ) => SavedDefinitionStore;
   private service: CronService | undefined;
+  private savedService: SavedCronService | undefined;
   private scheduler: Scheduler | undefined;
   private mainExecutor: MainExecutor | undefined;
   private isolatedExecutor: IsolatedExecutor | undefined;
@@ -83,6 +95,14 @@ export class CronRuntime implements CronRuntimeRef {
     this.clearIntervalFn =
       dependencies.clearInterval ??
       ((handle) => clearInterval(handle as NodeJS.Timeout));
+    this.savedStoreFactory =
+      dependencies.savedStoreFactory ??
+      ((ctx) =>
+        new ProjectCronStore({
+          cwd: ctx.cwd,
+          agentDir: getAgentDir(),
+          isProjectTrusted: () => ctx.isProjectTrusted(),
+        }));
   }
 
   start(
@@ -102,6 +122,12 @@ export class CronRuntime implements CronRuntimeRef {
         idFactory: () => makeJobId(),
         onChanged: () => this.refreshUi(),
         onObserverError: (error) => this.notifyError(error),
+      });
+      this.savedService = new SavedCronService({
+        store: this.savedStoreFactory(ctx),
+        approvals: new UiSavedApprovalPort(ctx, () => this.clock.now()),
+        clock: this.clock,
+        idFactory: () => makeJobId(),
       });
       this.lease = this.leaseFactory();
       const acquired = await this.lease.acquire(
@@ -139,6 +165,41 @@ export class CronRuntime implements CronRuntimeRef {
   requireService(): CronService {
     if (!this.service) throw new Error("Cron runtime is not started");
     return this.service;
+  }
+
+  requireSavedService(): SavedCronService {
+    if (!this.savedService) throw new Error("Cron runtime is not started");
+    return this.savedService;
+  }
+
+  assertSavedMutationAllowed(): void {
+    if (this.requireService().getActiveExecution()) {
+      throw new Error("Scheduled runs cannot mutate saved cron definitions");
+    }
+  }
+
+  async startSaved(
+    selector: string,
+    approvalMode: ApprovalMode = "interactive",
+  ): Promise<CronJob> {
+    this.requireWritable();
+    this.assertSavedMutationAllowed();
+    const ctx = this.ctx;
+    if (!ctx) throw new Error("Cron runtime is not started");
+    const definition = await this.requireSavedService().select(selector);
+    const draft = materializeSavedDefinition(definition, this.clock.now());
+    await validateActivationResources({
+      pi: this.pi,
+      cwd: ctx.cwd,
+      agentDir: getAgentDir(),
+      modelRegistry: ctx.modelRegistry,
+      prompt: draft.prompt,
+      schedule: draft.schedule,
+      execution: draft.execution ?? { kind: "main" },
+    });
+    return this.requireService().activateSaved(definition.id, draft, {
+      approvalMode,
+    });
   }
 
   getScheduler(): Scheduler | undefined {
@@ -265,6 +326,7 @@ export class CronRuntime implements CronRuntimeRef {
     this.isolatedExecutor = undefined;
     this.promptResolver = undefined;
     this.service = undefined;
+    this.savedService = undefined;
     this.lease = undefined;
     this.ctx = undefined;
     this.readOnlyOwner = undefined;
@@ -338,7 +400,16 @@ export class CronRuntime implements CronRuntimeRef {
     const now = this.clock.now().getTime();
     for (const job of service.list()) {
       if (job.state !== "active") continue;
-      if (reason === "fork" && job.originSessionId !== sessionId) {
+      if (
+        (reason === "startup" || reason === "resume") &&
+        job.savedDefinitionId
+      ) {
+        await service.transitionState(
+          job.id,
+          "paused",
+          "Saved cron requires explicit restart after session restoration",
+        );
+      } else if (reason === "fork" && job.originSessionId !== sessionId) {
         await service.transitionState(
           job.id,
           "paused",

@@ -154,6 +154,75 @@ export class CronService {
     });
   }
 
+  activateSaved(
+    savedDefinitionId: string,
+    draft: JobDraft,
+    options: MutationOptions = {},
+  ): Promise<CronJob> {
+    if (this.activeExecution) {
+      return Promise.reject(
+        new Error("Scheduled runs cannot activate saved cron definitions"),
+      );
+    }
+    return this.enqueueMutation(async () => {
+      if (this.activeExecution) {
+        throw new Error(
+          "Scheduled runs cannot activate saved cron definitions",
+        );
+      }
+      if (!savedDefinitionId.trim()) {
+        throw new Error("Saved cron definition ID cannot be empty");
+      }
+      const matches = [...this.jobs.values()].filter(
+        (job) => job.savedDefinitionId === savedDefinitionId,
+      );
+      if (matches.length > 1) {
+        throw new Error(
+          `Multiple session jobs reference saved cron definition '${savedDefinitionId}'`,
+        );
+      }
+      const previous = matches[0];
+      if (previous?.state === "active") {
+        throw new Error(
+          `Saved cron definition '${savedDefinitionId}' is already active in this session`,
+        );
+      }
+
+      const now = this.clock.now();
+      const id = previous?.id ?? this.generateUniqueId();
+      const proposed = buildProposedJob(
+        draft,
+        now,
+        this.sessionId,
+        id,
+        savedDefinitionId,
+      );
+      this.validateCandidate(proposed, draft.unsafeSeconds === true, now);
+      const approval = await this.approvals.approve(
+        structuredClone(proposed),
+        "create",
+        options.approvalMode ?? "interactive",
+      );
+      if (!approval) throw new Error("Saved cron activation cancelled");
+      this.validateCandidate(
+        proposed,
+        draft.unsafeSeconds === true,
+        this.clock.now(),
+      );
+      const approved: CronJob = {
+        ...proposed,
+        approval: structuredClone(approval),
+      };
+      this.persistAndApply({
+        version: 1,
+        type: previous ? "job_replaced" : "job_created",
+        at: this.clock.now().toISOString(),
+        job: approved,
+      });
+      return structuredClone(approved);
+    });
+  }
+
   replace(
     selector: string,
     patch: JobPatch,
@@ -603,6 +672,7 @@ function buildProposedJob(
   now: Date,
   sessionId: string,
   id: string,
+  savedDefinitionId?: string,
 ): ProposedJob {
   const timestamp = now.toISOString();
   const proposed: ProposedJob = {
@@ -627,6 +697,9 @@ function buildProposedJob(
   };
   if (draft.maxRuns !== undefined) proposed.maxRuns = draft.maxRuns;
   if (draft.tokenBudget !== undefined) proposed.tokenBudget = draft.tokenBudget;
+  if (savedDefinitionId !== undefined) {
+    proposed.savedDefinitionId = savedDefinitionId;
+  }
   return proposed;
 }
 

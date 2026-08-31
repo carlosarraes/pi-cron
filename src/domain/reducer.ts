@@ -200,6 +200,7 @@ export function isCronJob(value: unknown): value is CronJob {
       "pauseReason",
       "approval",
       "originSessionId",
+      "savedDefinitionId",
     ]) &&
     value.version === 1 &&
     isString(value.id) &&
@@ -231,7 +232,12 @@ export function isCronJob(value: unknown): value is CronJob {
     hasOptionalField(value, "lastTechnicalOutcome", isTechnicalOutcome) &&
     hasOptionalField(value, "pauseReason", isString) &&
     isApproval(value.approval) &&
-    isString(value.originSessionId)
+    isString(value.originSessionId) &&
+    hasOptionalField(
+      value,
+      "savedDefinitionId",
+      (field) => isString(field) && field.length > 0,
+    )
   );
 }
 

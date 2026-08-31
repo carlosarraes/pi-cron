@@ -3,6 +3,10 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
+import type {
+  SavedCronDefinition,
+  SavedDefinitionStore,
+} from "../src/domain/saved.js";
 import type { CronEvent, CronJob } from "../src/domain/types.js";
 import piCron from "../src/index.js";
 import { CronRuntime } from "../src/runtime.js";
@@ -27,6 +31,26 @@ function job(overrides: Partial<CronJob> = {}): CronJob {
     consecutiveFailures: 0,
     approval: { approvedAt: NOW, fingerprint: "ok" },
     originSessionId: "session-1",
+    ...overrides,
+  };
+}
+
+function savedDefinition(
+  overrides: Partial<SavedCronDefinition> = {},
+): SavedCronDefinition {
+  return {
+    version: 1,
+    id: "save1234",
+    name: "Saved report",
+    prompt: { kind: "text", text: "Run saved report" },
+    schedule: { kind: "interval", intervalMs: 60_000 },
+    execution: { kind: "main" },
+    overlap: "queue",
+    unsafeSeconds: false,
+    expiresAfterMs: 7 * 24 * 60 * 60_000,
+    createdAt: NOW,
+    updatedAt: NOW,
+    approval: { approvedAt: NOW, fingerprint: "saved-ok" },
     ...overrides,
   };
 }
@@ -78,6 +102,8 @@ function setup(
     sessionId?: string;
     lease?: FakeLease;
     reason?: "startup" | "reload" | "new" | "resume" | "fork";
+    savedDefinitions?: SavedCronDefinition[];
+    trusted?: boolean;
   } = {},
 ) {
   const entries = options.entries ?? [];
@@ -86,11 +112,34 @@ function setup(
   const sent: string[] = [];
   const statuses: Array<string | undefined> = [];
   const notifications: string[] = [];
+  const savedDefinitions = structuredClone(options.savedDefinitions ?? []);
+  const savedStore: SavedDefinitionStore = {
+    list: async () => {
+      if (options.trusted === false)
+        throw new Error("trusted project required");
+      return structuredClone(savedDefinitions);
+    },
+    create: async (definition) => {
+      savedDefinitions.push(structuredClone(definition));
+    },
+    replace: async (definition) => {
+      const index = savedDefinitions.findIndex(
+        (item) => item.id === definition.id,
+      );
+      if (index < 0) throw new Error("missing saved definition");
+      savedDefinitions[index] = structuredClone(definition);
+    },
+    delete: async (id) => {
+      const index = savedDefinitions.findIndex((item) => item.id === id);
+      if (index >= 0) savedDefinitions.splice(index, 1);
+    },
+  };
   const pi = {
     appendEntry: (type: string, data: unknown) => appended.push({ type, data }),
     sendUserMessage: (prompt: string) => sent.push(prompt),
     sendMessage: vi.fn(),
     getCommands: () => [],
+    getAllTools: () => [],
   } as unknown as ExtensionAPI;
   const ctx = {
     cwd: "/project",
@@ -103,7 +152,7 @@ function setup(
     modelRegistry: { getAvailable: () => [] },
     model: undefined,
     isIdle: () => true,
-    isProjectTrusted: () => true,
+    isProjectTrusted: () => options.trusted ?? true,
     getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
     ui: {
       setStatus: (_key: string, value: string | undefined) =>
@@ -125,6 +174,7 @@ function setup(
       return id;
     },
     clearInterval: (handle) => intervals.delete(handle as number),
+    savedStoreFactory: () => savedStore,
   });
   return {
     runtime,
@@ -137,6 +187,8 @@ function setup(
     statuses,
     notifications,
     intervals,
+    savedDefinitions,
+    savedStore,
     start: () => runtime.start(ctx, options.reason ?? "startup"),
   };
 }
@@ -352,5 +404,110 @@ describe("extension factory", () => {
       "agent_settled",
       "session_shutdown",
     ]);
+  });
+});
+
+describe("saved cron runtime lifecycle", () => {
+  it.each([
+    "startup",
+    "resume",
+  ] as const)("pauses saved-origin jobs before scheduling on %s", async (reason) => {
+    const configured = setup({
+      entries: [customEntry(event(job({ savedDefinitionId: "save1234" })))],
+      reason,
+    });
+    await configured.start();
+    expect(configured.runtime.requireService().get("job-1")).toMatchObject({
+      state: "paused",
+      pauseReason:
+        "Saved cron requires explicit restart after session restoration",
+    });
+    expect(configured.sent).toEqual([]);
+  });
+
+  it("keeps saved-origin jobs active across reload", async () => {
+    const configured = setup({
+      entries: [customEntry(event(job({ savedDefinitionId: "save1234" })))],
+      reason: "reload",
+    });
+    await configured.start();
+    expect(configured.runtime.requireService().get("job-1")?.state).toBe(
+      "active",
+    );
+  });
+
+  it("starts a saved definition as a fresh session activation", async () => {
+    const configured = setup({ savedDefinitions: [savedDefinition()] });
+    await configured.start();
+    expect(await configured.runtime.requireSavedService().list()).toHaveLength(
+      1,
+    );
+
+    const activated = await configured.runtime.startSaved(
+      "Saved report",
+      "automatic",
+    );
+    expect(activated).toMatchObject({
+      name: "Saved report",
+      savedDefinitionId: "save1234",
+      state: "active",
+      runCount: 0,
+    });
+  });
+
+  it("blocks saved mutations during scheduled execution without requiring the lease otherwise", async () => {
+    const configured = setup({
+      entries: [customEntry(event(job({ state: "paused" })))],
+      savedDefinitions: [savedDefinition()],
+      reason: "reload",
+    });
+    await configured.start();
+    expect(() => configured.runtime.assertSavedMutationAllowed()).not.toThrow();
+    const token = configured.runtime
+      .requireService()
+      .beginExecution("job-1", false);
+    expect(() => configured.runtime.assertSavedMutationAllowed()).toThrow(
+      "cannot mutate saved cron definitions",
+    );
+    configured.runtime.requireService().endExecution(token);
+  });
+
+  it("allows explicit pause/resume and keeps active copies independent of saved edits/deletion", async () => {
+    const configured = setup({ savedDefinitions: [savedDefinition()] });
+    await configured.start();
+    const activated = await configured.runtime.startSaved(
+      "save1234",
+      "automatic",
+    );
+    await configured.runtime
+      .requireService()
+      .pause(activated.id, "Paused by user");
+    expect(configured.runtime.requireService().get(activated.id)?.state).toBe(
+      "paused",
+    );
+    await configured.runtime.requireService().resume(activated.id);
+    await configured.runtime.requireSavedService().replace(
+      "save1234",
+      {
+        overlap: "skip",
+      },
+      { approvalMode: "automatic" },
+    );
+    await configured.runtime.requireSavedService().delete("save1234");
+    expect(configured.runtime.requireService().get(activated.id)).toMatchObject(
+      {
+        state: "active",
+        overlap: "queue",
+        savedDefinitionId: "save1234",
+      },
+    );
+  });
+
+  it("fails saved catalog access in an untrusted project", async () => {
+    const configured = setup({ trusted: false });
+    await configured.start();
+    await expect(
+      configured.runtime.requireSavedService().list(),
+    ).rejects.toThrow("trusted project required");
   });
 });

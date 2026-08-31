@@ -74,6 +74,7 @@ export interface CronJob {
   pauseReason?: string;
   approval: { approvedAt: string; fingerprint: string };
   originSessionId: string;
+  savedDefinitionId?: string;
 }
 
 export type CronEvent =

@@ -913,3 +913,94 @@ describe("CronService metrics and observers", () => {
     });
   });
 });
+
+describe("CronService saved activation", () => {
+  it("creates a fresh saved-origin job with automatic approval", async () => {
+    const { service, store, approvals } = makeService();
+    const activated = await service.activateSaved("save1234", validDraft(), {
+      approvalMode: "automatic",
+    });
+
+    expect(activated).toMatchObject({
+      id: "deadbeef",
+      savedDefinitionId: "save1234",
+      state: "active",
+      runCount: 0,
+      attributedTokens: 0,
+    });
+    expect(store.appended.at(-1)?.type).toBe("job_created");
+    expect(approvals.approve).toHaveBeenCalledWith(
+      expect.objectContaining({ savedDefinitionId: "save1234" }),
+      "create",
+      "automatic",
+    );
+  });
+
+  it("rejects an already active activation", async () => {
+    const existing = storedJob({ savedDefinitionId: "save1234" });
+    const { service } = makeService({ events: [created(existing)] });
+    await expect(
+      service.activateSaved("save1234", validDraft()),
+    ).rejects.toThrow("already active");
+  });
+
+  it("durably replaces an inactive activation and resets runtime fields", async () => {
+    const existing = storedJob({
+      savedDefinitionId: "save1234",
+      state: "paused",
+      runCount: 4,
+      attributedTokens: 99,
+      consecutiveFailures: 2,
+      lastSettledAt: NOW,
+    });
+    const { service, store } = makeService({ events: [created(existing)] });
+    const activated = await service.activateSaved(
+      "save1234",
+      validDraft({ name: "Fresh config" }),
+    );
+
+    expect(activated).toMatchObject({
+      id: existing.id,
+      name: "Fresh config",
+      state: "active",
+      runCount: 0,
+      attributedTokens: 0,
+      consecutiveFailures: 0,
+      savedDefinitionId: "save1234",
+    });
+    expect(activated.lastSettledAt).toBeUndefined();
+    expect(store.appended.at(-1)).toMatchObject({ type: "job_replaced" });
+  });
+
+  it("leaves an inactive activation untouched when approval fails", async () => {
+    const existing = storedJob({
+      savedDefinitionId: "save1234",
+      state: "paused",
+      runCount: 2,
+    });
+    const { service, store } = makeService({
+      events: [created(existing)],
+      approval: null,
+    });
+    await expect(
+      service.activateSaved("save1234", validDraft()),
+    ).rejects.toThrow("activation cancelled");
+    expect(service.get(existing.id)).toEqual(existing);
+    expect(store.appended).toEqual([]);
+  });
+
+  it("leaves an inactive activation untouched when durable append fails", async () => {
+    const existing = storedJob({
+      savedDefinitionId: "save1234",
+      state: "paused",
+      runCount: 2,
+    });
+    const store = new MemoryStore([], "disk full");
+    const { service } = makeService({ events: [created(existing)], store });
+    await expect(
+      service.activateSaved("save1234", validDraft()),
+    ).rejects.toThrow("disk full");
+    expect(service.get(existing.id)).toEqual(existing);
+    expect(store.appended).toEqual([]);
+  });
+});
