@@ -53,6 +53,8 @@ export interface ProjectCronStoreOptions {
   hooks?: {
     afterLockAcquired?: () => void | Promise<void>;
     beforeRename?: () => void | Promise<void>;
+    beforeStaleRecovery?: () => void | Promise<void>;
+    afterLockValidated?: () => void | Promise<void>;
   };
 }
 
@@ -155,6 +157,7 @@ export class ProjectCronStore implements SavedDefinitionStore {
       catalogPath: join(projectDir, "crons.json"),
       lockDir,
       lockPath: join(lockDir, projectHash),
+      publicationLockPath: join(lockDir, `${projectHash}.publish`),
     };
   }
 
@@ -170,7 +173,10 @@ export class ProjectCronStore implements SavedDefinitionStore {
   ): Promise<void> {
     await mkdir(paths.lockDir, { recursive: true, mode: 0o700 });
     await chmod(paths.lockDir, 0o700);
-    const lock = await this.acquireLock(paths.lockPath);
+    const lock = await this.acquireLock(
+      paths.lockPath,
+      paths.publicationLockPath,
+    );
     let operationError: unknown;
     try {
       await this.hooks.afterLockAcquired?.();
@@ -189,7 +195,10 @@ export class ProjectCronStore implements SavedDefinitionStore {
     if (releaseError !== undefined) throw releaseError;
   }
 
-  private async acquireLock(lockPath: string): Promise<LockSnapshot> {
+  private async acquireLock(
+    lockPath: string,
+    recoveryGuardPath?: string,
+  ): Promise<LockSnapshot> {
     let lastOwner: LockRecord | undefined;
     let lastError: unknown;
 
@@ -230,7 +239,8 @@ export class ProjectCronStore implements SavedDefinitionStore {
         continue;
       }
 
-      if (!this.isStale(existing.record)) {
+      const recoverOverAge = recoveryGuardPath !== undefined;
+      if (!this.isStale(existing.record, recoverOverAge)) {
         lastError = new Error(
           "Project cron catalog lock is held by a live owner",
         );
@@ -238,30 +248,59 @@ export class ProjectCronStore implements SavedDefinitionStore {
         continue;
       }
 
-      const stalePath = `${lockPath}.dead-${this.pid}-${this.tokenFactory()}`;
+      await this.hooks.beforeStaleRecovery?.();
+      const recoveryGuard = recoveryGuardPath
+        ? await this.acquireLock(recoveryGuardPath)
+        : undefined;
       try {
-        await rename(lockPath, stalePath);
-      } catch (error) {
-        if (isNodeError(error, "ENOENT")) continue;
-        throw error;
-      }
-      try {
-        const moved = await readLockSnapshot(stalePath);
+        let guardedExisting: LockSnapshot;
+        try {
+          guardedExisting = await readLockSnapshot(lockPath);
+        } catch (error) {
+          if (isNodeError(error, "ENOENT")) continue;
+          throw error;
+        }
         if (
-          !sameFile(existing, moved) ||
-          !sameLockRecord(existing.record, moved.record)
+          !sameFile(existing, guardedExisting) ||
+          !sameLockRecord(existing.record, guardedExisting.record) ||
+          !this.isStale(guardedExisting.record, recoverOverAge)
         ) {
-          await restoreMovedFile(stalePath, lockPath);
           lastError = new Error(
             "Project cron catalog lock changed during recovery",
           );
           await delay(this.lockRetryMs);
           continue;
         }
-        await rm(stalePath, { force: true });
-      } catch (error) {
-        await restoreMovedFile(stalePath, lockPath);
-        throw error;
+
+        const stalePath = `${lockPath}.dead-${this.pid}-${this.tokenFactory()}`;
+        try {
+          await rename(lockPath, stalePath);
+        } catch (error) {
+          if (isNodeError(error, "ENOENT")) continue;
+          throw error;
+        }
+        try {
+          const moved = await readLockSnapshot(stalePath);
+          if (
+            !sameFile(guardedExisting, moved) ||
+            !sameLockRecord(guardedExisting.record, moved.record)
+          ) {
+            await restoreMovedFile(stalePath, lockPath);
+            lastError = new Error(
+              "Project cron catalog lock changed during recovery",
+            );
+            await delay(this.lockRetryMs);
+            continue;
+          }
+          await rm(stalePath, { force: true });
+        } catch (error) {
+          await restoreMovedFile(stalePath, lockPath);
+          throw error;
+        }
+      } finally {
+        if (recoveryGuard && recoveryGuardPath) {
+          await this.releaseLock(recoveryGuardPath, recoveryGuard);
+        }
       }
     }
 
@@ -271,9 +310,11 @@ export class ProjectCronStore implements SavedDefinitionStore {
     });
   }
 
-  private isStale(record: LockRecord): boolean {
+  private isStale(record: LockRecord, recoverOverAge: boolean): boolean {
+    if (!this.isPidAlive(record.pid)) return true;
+    if (!recoverOverAge) return false;
     const age = this.clock.now().getTime() - Date.parse(record.acquiredAt);
-    return !this.isPidAlive(record.pid) || age > this.lockStaleAfterMs;
+    return age > this.lockStaleAfterMs;
   }
 
   private async assertLockOwned(
@@ -332,8 +373,14 @@ export class ProjectCronStore implements SavedDefinitionStore {
       const content = `${JSON.stringify(catalog, null, 2)}\n`;
       await writeSyncedFile(temporaryPath, content, 0o600);
       await this.hooks.beforeRename?.();
-      await this.assertLockOwned(paths.lockPath, lock);
-      await rename(temporaryPath, paths.catalogPath);
+      const publicationLock = await this.acquireLock(paths.publicationLockPath);
+      try {
+        await this.assertLockOwned(paths.lockPath, lock);
+        await this.hooks.afterLockValidated?.();
+        await rename(temporaryPath, paths.catalogPath);
+      } finally {
+        await this.releaseLock(paths.publicationLockPath, publicationLock);
+      }
     } finally {
       await rm(temporaryPath, { force: true });
     }
@@ -345,6 +392,7 @@ interface StorePaths {
   catalogPath: string;
   lockDir: string;
   lockPath: string;
+  publicationLockPath: string;
 }
 
 async function readCatalog(path: string): Promise<SavedCronCatalog> {

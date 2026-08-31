@@ -265,40 +265,59 @@ describe("ProjectCronStore", () => {
     );
   });
 
-  it("prevents an over-age original writer from publishing after lock recovery", async () => {
+  it("fences over-age recovery from a validated catalog publication", async () => {
     const { cwd, agentDir } = await workspace();
     let now = new Date(NOW);
-    let release!: () => void;
-    const blocked = new Promise<void>((resolve) => {
-      release = resolve;
+    let releaseValidation!: () => void;
+    const validationBlocked = new Promise<void>((resolve) => {
+      releaseValidation = resolve;
     });
-    let acquired!: () => void;
-    const acquiredPromise = new Promise<void>((resolve) => {
-      acquired = resolve;
+    let validated!: () => void;
+    const validatedPromise = new Promise<void>((resolve) => {
+      validated = resolve;
     });
     const first = makeStore(cwd, agentDir, {
       pid: 201,
       clock: { now: () => now },
       hooks: {
-        afterLockAcquired: () => {
-          acquired();
-          return blocked;
+        afterLockValidated: () => {
+          validated();
+          return validationBlocked;
         },
       },
     });
     const firstWrite = first.create(definition());
-    await acquiredPromise;
+    await validatedPromise;
+
     now = new Date(Date.parse(NOW) + 31_000);
+    let secondSettled = false;
+    let recoveryAttempted!: () => void;
+    const recoveryAttemptedPromise = new Promise<void>((resolve) => {
+      recoveryAttempted = resolve;
+    });
     const second = makeStore(cwd, agentDir, {
       pid: 202,
       clock: { now: () => now },
+      lockMaxAttempts: 100,
+      lockRetryMs: 2,
       lockStaleAfterMs: 30_000,
+      hooks: { beforeStaleRecovery: recoveryAttempted },
     });
-    await second.create(definition({ id: "deadbeef", name: "Winner" }));
-    release();
+    const secondWrite = second
+      .create(definition({ id: "deadbeef", name: "Winner" }))
+      .finally(() => {
+        secondSettled = true;
+      });
+    await recoveryAttemptedPromise;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(secondSettled).toBe(false);
 
-    await expect(firstWrite).rejects.toThrow("lock ownership was lost");
-    expect((await second.list()).map((item) => item.name)).toEqual(["Winner"]);
+    releaseValidation();
+    await Promise.all([firstWrite, secondWrite]);
+    expect((await second.list()).map((item) => item.name).sort()).toEqual([
+      "Daily report",
+      "Winner",
+    ]);
   });
 
   it("does not leak transaction lock artifacts", async () => {
