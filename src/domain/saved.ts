@@ -53,8 +53,18 @@ export type SavedDefinitionPatch = Partial<SavedDefinitionDraft>;
 export interface SavedDefinitionStore {
   list(): Promise<SavedCronDefinition[]>;
   create(definition: SavedCronDefinition): Promise<void>;
-  replace(definition: SavedCronDefinition): Promise<void>;
+  replace(
+    definition: SavedCronDefinition,
+    expected: SavedCronDefinition,
+  ): Promise<void>;
   delete(id: string): Promise<void>;
+}
+
+export class SavedDefinitionConflictError extends Error {
+  constructor(id: string) {
+    super(`Saved cron definition changed concurrently: ${id}`);
+    this.name = "SavedDefinitionConflictError";
+  }
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -102,7 +112,7 @@ export function assertSavedCatalog(value: unknown): SavedCronCatalog {
     if (names.has(name))
       throw new Error("Duplicate saved cron definition name");
     names.add(name);
-    validateSavedSchedule(definition, false);
+    validateSavedSchedule(definition);
   }
   return {
     version: SAVED_CATALOG_VERSION,
@@ -131,7 +141,7 @@ export function validateSavedCandidate(
       `A saved cron definition named '${candidate.name}' already exists`,
     );
   }
-  validateSavedSchedule(candidate, true);
+  validateSavedSchedule(candidate);
 }
 
 export function selectSavedDefinition(
@@ -339,7 +349,6 @@ function isApproval(value: unknown): value is CronJob["approval"] {
 
 function validateSavedSchedule(
   candidate: ProposedSavedCronDefinition | SavedCronDefinition,
-  requireFutureAbsolute: boolean,
 ): void {
   const { schedule } = candidate;
   if (schedule.kind === "cron") {
@@ -351,16 +360,6 @@ function validateSavedSchedule(
       },
       new Date(candidate.updatedAt),
     );
-    return;
-  }
-  if (
-    requireFutureAbsolute &&
-    schedule.kind === "once" &&
-    schedule.timing.kind === "absolute"
-  ) {
-    if (Date.parse(schedule.timing.at) <= Date.parse(candidate.updatedAt)) {
-      throw new Error("Saved absolute one-shot must be in the future");
-    }
     return;
   }
   const intervalMs =

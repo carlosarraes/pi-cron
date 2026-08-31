@@ -6,6 +6,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { CronJob, ExecutionMode, Schedule } from "../domain/types.js";
 import { buildResourceLoader, resolveModel } from "./isolated-executor.js";
+import { assertIsolatedCronToolsAllowed } from "./tool-policy.js";
 
 type IsolatedExecution = Extract<ExecutionMode, { kind: "isolated" }>;
 type LoaderPort = Pick<
@@ -48,6 +49,8 @@ export async function validateActivationResources(options: {
       `Thinking effort '${execution.effort}' is unavailable for ${model.provider}/${model.id}`,
     );
   }
+
+  assertIsolatedCronToolsAllowed(execution.tools);
 
   const availableTools = new Set(
     options.pi.getAllTools().map((tool) => tool.name),

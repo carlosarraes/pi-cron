@@ -100,10 +100,32 @@ describe("ProjectCronStore", () => {
       definitions: [definition()],
     });
 
-    await store.replace(definition({ name: "Updated" }));
+    await store.replace(definition({ name: "Updated" }), definition());
     expect((await store.list())[0]?.name).toBe("Updated");
     await store.delete("abcd1234");
     expect(await store.list()).toEqual([]);
+  });
+
+  it("rejects a stale replacement instead of overwriting a concurrent update", async () => {
+    const { cwd, agentDir } = await workspace();
+    const first = makeStore(cwd, agentDir, { pid: 101 });
+    const second = makeStore(cwd, agentDir, { pid: 102 });
+    const original = definition();
+    await first.create(original);
+    const firstSnapshot = (await first.list())[0];
+    const secondSnapshot = (await second.list())[0];
+    await first.replace(
+      { ...firstSnapshot, name: "First update" },
+      firstSnapshot,
+    );
+
+    await expect(
+      second.replace({ ...secondSnapshot, overlap: "skip" }, secondSnapshot),
+    ).rejects.toThrow("changed concurrently");
+    expect((await first.list())[0]).toMatchObject({
+      name: "First update",
+      overlap: "queue",
+    });
   });
 
   it("rejects every operation for an untrusted project without reading the file", async () => {
@@ -114,7 +136,7 @@ describe("ProjectCronStore", () => {
 
     await expect(store.list()).rejects.toThrow("trusted project");
     await expect(store.create(definition())).rejects.toThrow("trusted project");
-    await expect(store.replace(definition())).rejects.toThrow(
+    await expect(store.replace(definition(), definition())).rejects.toThrow(
       "trusted project",
     );
     await expect(store.delete("abcd1234")).rejects.toThrow("trusted project");
@@ -160,9 +182,9 @@ describe("ProjectCronStore", () => {
       },
     });
 
-    await expect(failing.replace(definition({ name: "Lost" }))).rejects.toThrow(
-      "publish failed",
-    );
+    await expect(
+      failing.replace(definition({ name: "Lost" }), definition()),
+    ).rejects.toThrow("publish failed");
     expect(await readFile(catalogPath, "utf8")).toBe(before);
     expect(
       (await readdir(join(cwd, ".pi"))).filter((name) =>
@@ -234,7 +256,7 @@ describe("ProjectCronStore", () => {
     await makeStore(cwd, agentDir, {
       isPidAlive: () => true,
       lockStaleAfterMs: 500,
-    }).replace(definition({ name: "Recovered" }));
+    }).replace(definition({ name: "Recovered" }), definition());
     expect((await makeStore(cwd, agentDir).list())[0]?.name).toBe("Recovered");
   });
 

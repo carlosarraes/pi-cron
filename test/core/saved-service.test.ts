@@ -1,13 +1,15 @@
+import { isDeepStrictEqual } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import {
   type SavedApprovalPort,
   SavedCronService,
 } from "../../src/core/saved-service.js";
-import type {
-  ProposedSavedCronDefinition,
-  SavedCronDefinition,
-  SavedDefinitionDraft,
-  SavedDefinitionStore,
+import {
+  type ProposedSavedCronDefinition,
+  type SavedCronDefinition,
+  SavedDefinitionConflictError,
+  type SavedDefinitionDraft,
+  type SavedDefinitionStore,
 } from "../../src/domain/saved.js";
 import type { CronJob } from "../../src/domain/types.js";
 import { FakeClock } from "../helpers/fakes.js";
@@ -26,12 +28,18 @@ class MemorySavedStore implements SavedDefinitionStore {
     if (this.failure) throw new Error(this.failure);
     this.definitions.push(structuredClone(definition));
   }
-  async replace(definition: SavedCronDefinition): Promise<void> {
+  async replace(
+    definition: SavedCronDefinition,
+    expected: SavedCronDefinition,
+  ): Promise<void> {
     if (this.failure) throw new Error(this.failure);
     const index = this.definitions.findIndex(
       (item) => item.id === definition.id,
     );
     if (index < 0) throw new Error("missing");
+    if (!isDeepStrictEqual(this.definitions[index], expected)) {
+      throw new SavedDefinitionConflictError(definition.id);
+    }
     this.definitions[index] = structuredClone(definition);
   }
   async delete(id: string): Promise<void> {
@@ -178,6 +186,24 @@ describe("SavedCronService", () => {
     expect(store.definitions[0]).not.toHaveProperty("attributedTokens");
   });
 
+  it("allows copying and editing a past absolute one-shot definition", async () => {
+    const { service } = setup();
+    const copied = await service.copy(
+      job({
+        state: "missed",
+        schedule: {
+          kind: "once",
+          at: "2026-07-14T11:00:00.000Z",
+          original: "2026-07-14T11:00:00.000Z",
+        },
+      }),
+    );
+
+    await expect(
+      service.replace(copied.id, { name: "Past one-shot template" }),
+    ).resolves.toMatchObject({ name: "Past one-shot template" });
+  });
+
   it("reuses approval for safe reductions and reapproves privilege increases", async () => {
     const { service, approve } = setup();
     const created = await service.create(draft());
@@ -201,6 +227,29 @@ describe("SavedCronService", () => {
       "privilege_increase",
       "automatic",
     );
+  });
+
+  it("reapplies a patch to the latest definition after a concurrent edit", async () => {
+    const { service, store } = setup();
+    const created = await service.create(draft());
+    const originalReplace = store.replace.bind(store);
+    let conflicted = false;
+    store.replace = async (definition, expected) => {
+      if (!conflicted) {
+        conflicted = true;
+        store.definitions[0] = {
+          ...store.definitions[0],
+          name: "Concurrent name",
+        };
+        throw new SavedDefinitionConflictError(definition.id);
+      }
+      return originalReplace(definition, expected);
+    };
+
+    const updated = await service.replace(created.id, { overlap: "skip" });
+
+    expect(updated).toMatchObject({ name: "Concurrent name", overlap: "skip" });
+    expect(store.definitions[0]).toEqual(updated);
   });
 
   it("preserves optional values on omission and clears explicit undefined limits", async () => {

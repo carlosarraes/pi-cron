@@ -12,7 +12,7 @@ import {
 } from "../domain/types.js";
 import type { JobDraft, JobPatch } from "./service.js";
 
-const DURATION_INPUT = /^[1-9]\d*(?:s|m|h|d)$/;
+const DURATION_INPUT = /^[1-9]\d*(?:ms|s|m|h|d)$/;
 
 export function savedDraftFromJobDraft(
   draft: JobDraft,
@@ -121,7 +121,7 @@ function savedScheduleFromRuntime(schedule: Schedule): SavedSchedule {
             kind: "once",
             timing: {
               kind: "relative",
-              delayMs: parseDuration(schedule.original),
+              delayMs: parseSavedDuration(schedule.original),
             },
           }
         : {
@@ -223,7 +223,12 @@ function formatDurationInput(durationMs: number): string {
   ] as const) {
     if (durationMs % unitMs === 0) return `${durationMs / unitMs}${suffix}`;
   }
-  throw new Error("Saved relative one-shot delay must use whole seconds");
+  return `${durationMs}ms`;
+}
+
+function parseSavedDuration(value: string): number {
+  if (value.endsWith("ms")) return Number(value.slice(0, -2));
+  return parseDuration(value);
 }
 
 function checkedIso(timestamp: number, message: string): string {

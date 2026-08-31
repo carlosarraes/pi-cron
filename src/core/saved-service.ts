@@ -2,6 +2,7 @@ import {
   type ProposedSavedCronDefinition,
   requiresSavedReapproval,
   type SavedCronDefinition,
+  SavedDefinitionConflictError,
   type SavedDefinitionDraft,
   type SavedDefinitionPatch,
   type SavedDefinitionStore,
@@ -13,6 +14,7 @@ import { savedDraftFromJob } from "./saved-conversion.js";
 import type { MutationOptions } from "./service.js";
 
 const MAX_ID_ATTEMPTS = 16;
+const MAX_REPLACE_ATTEMPTS = 4;
 
 export interface SavedApprovalPort {
   approve(
@@ -91,27 +93,37 @@ export class SavedCronService {
     patch: SavedDefinitionPatch,
     options: MutationOptions = {},
   ): Promise<SavedCronDefinition> {
-    const definitions = await this.store.list();
-    const before = selectSavedDefinition(definitions, selector);
-    const after = applyPatch(before, patch, this.clock.now().toISOString());
-    const proposed = withoutApproval(after);
-    validateSavedCandidate(proposed, definitions);
+    let stableId: string | undefined;
+    for (let attempt = 0; attempt < MAX_REPLACE_ATTEMPTS; attempt += 1) {
+      const definitions = await this.store.list();
+      const before = selectSavedDefinition(definitions, stableId ?? selector);
+      stableId = before.id;
+      const after = applyPatch(before, patch, this.clock.now().toISOString());
+      const proposed = withoutApproval(after);
+      validateSavedCandidate(proposed, definitions);
 
-    if (requiresSavedReapproval(before, after)) {
-      const approval = await this.approvals.approve(
-        structuredClone(proposed),
-        "privilege_increase",
-        options.approvalMode ?? "interactive",
-      );
-      if (!approval) {
-        throw new Error("Saved cron definition replacement cancelled");
+      if (requiresSavedReapproval(before, after)) {
+        const approval = await this.approvals.approve(
+          structuredClone(proposed),
+          "privilege_increase",
+          options.approvalMode ?? "interactive",
+        );
+        if (!approval) {
+          throw new Error("Saved cron definition replacement cancelled");
+        }
+        after.approval = structuredClone(approval);
       }
-      after.approval = structuredClone(approval);
-    }
 
-    validateSavedCandidate(withoutApproval(after), await this.store.list());
-    await this.store.replace(after);
-    return structuredClone(after);
+      try {
+        await this.store.replace(after, before);
+        return structuredClone(after);
+      } catch (error) {
+        if (!(error instanceof SavedDefinitionConflictError)) throw error;
+      }
+    }
+    throw new Error(
+      `Saved cron definition changed too frequently to update: ${stableId ?? selector}`,
+    );
   }
 
   async delete(selector: string): Promise<void> {

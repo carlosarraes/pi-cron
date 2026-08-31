@@ -11,10 +11,12 @@ import {
   rm,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   assertSavedCatalog,
   type SavedCronCatalog,
   type SavedCronDefinition,
+  SavedDefinitionConflictError,
   type SavedDefinitionStore,
 } from "../domain/saved.js";
 
@@ -104,13 +106,19 @@ export class ProjectCronStore implements SavedDefinitionStore {
     }));
   }
 
-  async replace(definition: SavedCronDefinition): Promise<void> {
+  async replace(
+    definition: SavedCronDefinition,
+    expected: SavedCronDefinition,
+  ): Promise<void> {
     await this.mutate((catalog) => {
       const index = catalog.definitions.findIndex(
         (candidate) => candidate.id === definition.id,
       );
       if (index === -1) {
         throw new Error(`Saved cron definition not found: ${definition.id}`);
+      }
+      if (!isDeepStrictEqual(catalog.definitions[index], expected)) {
+        throw new SavedDefinitionConflictError(definition.id);
       }
       const definitions = structuredClone(catalog.definitions);
       definitions[index] = structuredClone(definition);

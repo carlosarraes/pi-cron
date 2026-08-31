@@ -461,6 +461,25 @@ describe("saved cron runtime lifecycle", () => {
     });
   });
 
+  it("rejects activation of a past absolute one-shot without changing state", async () => {
+    const past = savedDefinition({
+      schedule: {
+        kind: "once",
+        timing: { kind: "absolute", at: "2026-07-14T11:00:00.000Z" },
+      },
+    });
+    const configured = setup({ savedDefinitions: [past] });
+    await configured.start();
+
+    await expect(
+      configured.runtime.startSaved("save1234", "automatic"),
+    ).rejects.toThrow("must be in the future");
+    expect(await configured.runtime.requireSavedService().list()).toEqual([
+      past,
+    ]);
+    expect(configured.runtime.requireService().list()).toEqual([]);
+  });
+
   it("blocks saved mutations during scheduled execution without requiring the lease otherwise", async () => {
     const configured = setup({
       entries: [customEntry(event(job({ state: "paused" })))],

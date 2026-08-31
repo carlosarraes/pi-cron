@@ -17,6 +17,7 @@ import type { ActiveExecution } from "../core/service.js";
 import { parseDuration } from "../domain/schedule.js";
 import type { CronJob, DispatchResult } from "../domain/types.js";
 import type { PromptResolver } from "./prompt-resolver.js";
+import { assertIsolatedCronToolsAllowed } from "./tool-policy.js";
 
 const DISPLAY_LIMIT = 500;
 const ADAPTIVE_FALLBACK_MS = 20 * 60_000;
@@ -168,6 +169,7 @@ export class IsolatedExecutor {
     let run: ActiveRun | undefined;
 
     try {
+      assertIsolatedCronToolsAllowed(execution.tools);
       const prompt = await this.options.resolver.resolve(job);
       const model = resolveModel(this.options.modelRegistry, execution.model);
       const supported = getSupportedThinkingLevels(model);

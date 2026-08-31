@@ -7,6 +7,7 @@ import type {
 import { describe, expect, it, vi } from "vitest";
 import type { ExecutionMode, Schedule } from "../../src/domain/types.js";
 import { validateActivationResources } from "../../src/execution/resource-validator.js";
+import { FORBIDDEN_ISOLATED_CRON_TOOLS } from "../../src/execution/tool-policy.js";
 
 const schedule: Schedule = {
   kind: "interval",
@@ -152,6 +153,23 @@ describe("validateActivationResources", () => {
         ...setup({ errors: [{ path: "/bad", error: "boom" }] }),
       }),
     ).rejects.toThrow("extension loading failed");
+  });
+
+  it("rejects every saved-definition mutation tool in isolated execution", async () => {
+    for (const tool of FORBIDDEN_ISOLATED_CRON_TOOLS) {
+      const configured = setup({ tools: [tool] });
+      await expect(
+        validateActivationResources({
+          ...configured,
+          cwd: "/project",
+          agentDir: "/agent",
+          prompt: { kind: "text", text: "hello" },
+          schedule,
+          execution: { ...isolated, tools: [tool], skills: [], extensions: [] },
+        }),
+      ).rejects.toThrow(`cannot mutate saved definitions: ${tool}`);
+      expect(configured.loader.reload).not.toHaveBeenCalled();
+    }
   });
 
   it("skips isolated resource loading for main execution", async () => {

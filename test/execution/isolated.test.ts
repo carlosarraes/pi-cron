@@ -230,6 +230,29 @@ describe("buildResourceLoader", () => {
 });
 
 describe("IsolatedExecutor", () => {
+  it("rejects saved-definition mutation tools before creating a child session", async () => {
+    const { executor, captured, service } = harness({});
+    const current = isolatedJob();
+    if (current.execution.kind !== "isolated")
+      throw new Error("expected isolated");
+    const result = await executor.execute(
+      isolatedJob({
+        execution: {
+          ...current.execution,
+          tools: ["cron_saved_start"],
+        },
+      }),
+      new Date(NOW),
+    );
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      error: expect.stringContaining("cannot mutate saved definitions"),
+    });
+    expect(captured).toEqual([]);
+    expect(service.getActiveExecution()).toBeUndefined();
+  });
+
   it("creates a fresh restricted session and aggregates assistant usage", async () => {
     const { executor, captured, session, entries, messages } = harness({});
     const result = await executor.execute(isolatedJob(), new Date(NOW));

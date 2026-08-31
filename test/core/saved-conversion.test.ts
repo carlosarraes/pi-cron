@@ -225,6 +225,25 @@ describe("saved definition materialization", () => {
     ).toThrow("Saved absolute one-shot must be in the future");
   });
 
+  it("round-trips relative one-shot delays with millisecond precision", () => {
+    const definition = saved({
+      schedule: {
+        kind: "once",
+        timing: { kind: "relative", delayMs: 1_500 },
+      },
+    });
+
+    const materialized = materializeSavedDefinition(definition, new Date(NOW));
+    expect(materialized.schedule).toEqual({
+      kind: "once",
+      at: "2026-07-14T12:00:01.500Z",
+      original: "1500ms",
+    });
+    expect(
+      savedDraftFromJobDraft(materialized, new Date(NOW)).schedule,
+    ).toEqual(definition.schedule);
+  });
+
   it("creates fresh adaptive wakeups and maintenance anchors", () => {
     expect(
       materializeSavedDefinition(
