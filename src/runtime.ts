@@ -57,6 +57,11 @@ interface LeasePort {
   release(): Promise<void>;
 }
 
+interface RecoveryCleanup {
+  scheduler: Scheduler | undefined;
+  isolatedExecutor: IsolatedExecutor | undefined;
+}
+
 const RECOVERY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000] as const;
 
 export interface CronRuntimeDependencies {
@@ -88,6 +93,8 @@ export class CronRuntime implements CronRuntimeRef {
   private recoveryAttempt = 0;
   private retryExistingLease = false;
   private releaseLeaseBeforeAcquire = false;
+  private recoveryCleanup: RecoveryCleanup | undefined;
+  private cleanupErrorNotified = false;
   private generation = 0;
   private lossNotified = false;
   private ctx: ExtensionContext | undefined;
@@ -121,23 +128,7 @@ export class CronRuntime implements CronRuntimeRef {
       const generation = ++this.generation;
       await this.stopInternal();
       this.ctx = ctx;
-      const store = new PiEventStore(this.pi, ctx.sessionManager);
-      this.service = new CronService({
-        events: store.load(),
-        store,
-        approvals: new UiApprovalPort(ctx, () => this.clock.now()),
-        clock: this.clock,
-        sessionId: ctx.sessionManager.getSessionId(),
-        idFactory: () => makeJobId(),
-        onChanged: () => this.refreshUi(),
-        onObserverError: (error) => this.notifyError(error),
-      });
-      this.savedService = new SavedCronService({
-        store: this.savedStoreFactory(ctx),
-        approvals: new UiSavedApprovalPort(ctx, () => this.clock.now()),
-        clock: this.clock,
-        idFactory: () => makeJobId(),
-      });
+      this.rebuildServices(ctx);
       this.lease = this.leaseFactory();
       let acquired: { owned: true } | { owned: false; owner: LeaseRecord };
       try {
@@ -318,8 +309,9 @@ export class CronRuntime implements CronRuntimeRef {
     this.retryExistingLease = false;
     this.releaseLeaseBeforeAcquire = false;
     this.lossNotified = false;
-    const scheduler = this.scheduler;
-    const isolated = this.isolatedExecutor;
+    const recoveryCleanup = this.recoveryCleanup;
+    const scheduler = this.scheduler ?? recoveryCleanup?.scheduler;
+    const isolated = this.isolatedExecutor ?? recoveryCleanup?.isolatedExecutor;
     const service = this.service;
     const lease = this.lease;
     let firstError: unknown;
@@ -346,6 +338,8 @@ export class CronRuntime implements CronRuntimeRef {
     this.mainExecutor = undefined;
     this.isolatedExecutor = undefined;
     this.promptResolver = undefined;
+    this.recoveryCleanup = undefined;
+    this.cleanupErrorNotified = false;
     this.service = undefined;
     this.savedService = undefined;
     this.lease = undefined;
@@ -500,16 +494,9 @@ export class CronRuntime implements CronRuntimeRef {
   ): Promise<void> {
     if (generation !== this.generation) return;
     this.clearHeartbeat();
-    const scheduler = this.scheduler;
-    scheduler?.stop();
-    this.mainExecutor?.abortPending("runtime lease ownership lost");
-    await this.isolatedExecutor?.abortAll();
-    await scheduler?.waitForIdle();
-    if (generation !== this.generation) return;
-    this.scheduler = undefined;
-    this.mainExecutor = undefined;
-    this.isolatedExecutor = undefined;
-    this.promptResolver = undefined;
+    this.recoveryAttempt = 0;
+    this.retryExistingLease = previouslyOwned;
+    this.releaseLeaseBeforeAcquire = false;
     if (previouslyOwned && !this.lossNotified) {
       this.lossNotified = true;
       this.ctx?.ui.notify(
@@ -517,9 +504,14 @@ export class CronRuntime implements CronRuntimeRef {
         "error",
       );
     }
-    this.recoveryAttempt = 0;
-    this.retryExistingLease = previouslyOwned;
-    this.releaseLeaseBeforeAcquire = false;
+    this.beginRecoveryCleanup();
+    const cleaned = await this.finishRecoveryCleanup(generation);
+    if (generation !== this.generation) return;
+    if (!cleaned) {
+      this.scheduleRecovery(generation);
+      this.refreshUi();
+      return;
+    }
     this.scheduleRecovery(generation);
     this.refreshUi();
   }
@@ -549,6 +541,14 @@ export class CronRuntime implements CronRuntimeRef {
     if (generation !== this.generation || !this.ctx) return;
     const ctx = this.ctx;
 
+    const cleaned = await this.finishRecoveryCleanup(generation);
+    if (generation !== this.generation) return;
+    if (!cleaned) {
+      this.recoveryAttempt += 1;
+      this.scheduleRecovery(generation);
+      return;
+    }
+
     if (this.releaseLeaseBeforeAcquire) {
       const released = await this.releasePendingLease(generation);
       if (!released || generation !== this.generation) return;
@@ -567,7 +567,7 @@ export class CronRuntime implements CronRuntimeRef {
       if (generation !== this.generation) return;
       if (heartbeatSucceeded) {
         try {
-          await this.resumeOwnedRuntime(ctx, generation);
+          await this.rebuildOwnedRuntime(ctx, generation);
           return;
         } catch {
           await this.prepareOwnedLeaseRetry(existing, generation);
@@ -606,7 +606,7 @@ export class CronRuntime implements CronRuntimeRef {
 
     this.lease = candidate;
     try {
-      await this.resumeOwnedRuntime(ctx, generation);
+      await this.rebuildOwnedRuntime(ctx, generation);
     } catch {
       await this.prepareOwnedLeaseRetry(candidate, generation);
     }
@@ -623,6 +623,39 @@ export class CronRuntime implements CronRuntimeRef {
     if (!released || generation !== this.generation) return;
     this.recoveryAttempt += 1;
     this.scheduleRecovery(generation);
+  }
+
+  private beginRecoveryCleanup(): void {
+    if (this.recoveryCleanup) return;
+    const scheduler = this.scheduler;
+    const isolatedExecutor = this.isolatedExecutor;
+    scheduler?.stop();
+    this.mainExecutor?.abortPending("runtime lease ownership lost");
+    this.scheduler = undefined;
+    this.mainExecutor = undefined;
+    this.isolatedExecutor = undefined;
+    this.promptResolver = undefined;
+    this.recoveryCleanup = { scheduler, isolatedExecutor };
+  }
+
+  private async finishRecoveryCleanup(generation: number): Promise<boolean> {
+    const cleanup = this.recoveryCleanup;
+    if (!cleanup) return true;
+    try {
+      await cleanup.isolatedExecutor?.abortAll();
+      await cleanup.scheduler?.waitForIdle();
+    } catch (error) {
+      if (generation !== this.generation) return false;
+      if (!this.cleanupErrorNotified) {
+        this.cleanupErrorNotified = true;
+        this.notifyError(error);
+      }
+      return false;
+    }
+    if (generation !== this.generation) return false;
+    if (this.recoveryCleanup === cleanup) this.recoveryCleanup = undefined;
+    this.cleanupErrorNotified = false;
+    return true;
   }
 
   private async releasePendingLease(generation: number): Promise<boolean> {
@@ -645,10 +678,32 @@ export class CronRuntime implements CronRuntimeRef {
     return true;
   }
 
-  private async resumeOwnedRuntime(
+  private rebuildServices(ctx: ExtensionContext): void {
+    const store = new PiEventStore(this.pi, ctx.sessionManager);
+    this.service = new CronService({
+      events: store.load(),
+      store,
+      approvals: new UiApprovalPort(ctx, () => this.clock.now()),
+      clock: this.clock,
+      sessionId: ctx.sessionManager.getSessionId(),
+      idFactory: () => makeJobId(),
+      onChanged: () => this.refreshUi(),
+      onObserverError: (error) => this.notifyError(error),
+    });
+    this.savedService = new SavedCronService({
+      store: this.savedStoreFactory(ctx),
+      approvals: new UiSavedApprovalPort(ctx, () => this.clock.now()),
+      clock: this.clock,
+      idFactory: () => makeJobId(),
+    });
+  }
+
+  private async rebuildOwnedRuntime(
     ctx: ExtensionContext,
     generation: number,
   ): Promise<void> {
+    if (generation !== this.generation) return;
+    this.rebuildServices(ctx);
     if (generation !== this.generation) return;
     await this.classifyResume("reload");
     if (generation !== this.generation) return;
@@ -659,7 +714,13 @@ export class CronRuntime implements CronRuntimeRef {
     this.recoveryAttempt = 0;
     this.retryExistingLease = false;
     this.releaseLeaseBeforeAcquire = false;
+    this.recoveryCleanup = undefined;
+    this.cleanupErrorNotified = false;
     this.lossNotified = false;
+    ctx.ui.notify(
+      "pi-cron: runtime lease recovered; scheduling resumed",
+      "info",
+    );
     this.refreshUi();
   }
 
