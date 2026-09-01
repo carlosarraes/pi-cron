@@ -155,7 +155,7 @@ export class CronRuntime implements CronRuntimeRef {
       } catch (error) {
         if (generation !== this.generation) return;
         this.lease = candidate;
-        await this.enterRecovery(generation, error, false);
+        await this.enterRecovery(generation, error, false, true);
         this.refreshUi();
         return;
       }
@@ -526,12 +526,13 @@ export class CronRuntime implements CronRuntimeRef {
     generation: number,
     _error: unknown,
     previouslyOwned: boolean,
+    releaseLeaseBeforeAcquire = false,
   ): Promise<void> {
     if (generation !== this.generation) return;
     this.clearHeartbeat();
     this.recoveryAttempt = 0;
     this.retryExistingLease = previouslyOwned;
-    this.releaseLeaseBeforeAcquire = false;
+    this.releaseLeaseBeforeAcquire = releaseLeaseBeforeAcquire;
     this.beginRecoveryCleanup();
     if (previouslyOwned && !this.lossNotified) {
       this.lossNotified = true;

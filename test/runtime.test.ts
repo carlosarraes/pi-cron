@@ -331,6 +331,30 @@ describe("CronRuntime", () => {
     );
   });
 
+  it("releases an ambiguous startup acquisition before trying another lease", async () => {
+    const ambiguous = new FakeLease({
+      acquire: [new Error("publish cleanup failed")],
+      release: [new Error("release busy"), undefined],
+    });
+    const replacement = new FakeLease({ owned: true });
+    const configured = setup({ entries: [], leases: [ambiguous, replacement] });
+
+    await configured.start();
+    expect(configured.runtime.getScheduler()).toBeUndefined();
+    expect(configured.clock.pendingTimerCount()).toBe(1);
+
+    configured.clock.advanceBy(5_000);
+    await configured.flushLifecycle();
+    expect(ambiguous.releases).toBe(1);
+    expect(replacement.acquired).toEqual([]);
+
+    configured.clock.advanceBy(10_000);
+    await configured.flushLifecycle();
+    expect(ambiguous.releases).toBe(2);
+    expect(replacement.acquired).toEqual(["session-1"]);
+    expect(configured.runtime.getScheduler()).toBeDefined();
+  });
+
   it("classifies expired, exhausted, and missed one-shot jobs on resume", async () => {
     const entries = [
       customEntry(
