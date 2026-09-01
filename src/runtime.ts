@@ -57,6 +57,8 @@ interface LeasePort {
   release(): Promise<void>;
 }
 
+const RECOVERY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000] as const;
+
 export interface CronRuntimeDependencies {
   clock?: Clock;
   leaseFactory?: () => LeasePort;
@@ -82,6 +84,11 @@ export class CronRuntime implements CronRuntimeRef {
   private promptResolver: PromptResolver | undefined;
   private lease: LeasePort | undefined;
   private heartbeatHandle: unknown;
+  private recoveryHandle: unknown;
+  private recoveryAttempt = 0;
+  private retryExistingLease = false;
+  private generation = 0;
+  private lossNotified = false;
   private ctx: ExtensionContext | undefined;
   private readOnlyOwner: LeaseRecord | undefined;
   private lifecycle: Promise<void> = Promise.resolve();
@@ -110,6 +117,7 @@ export class CronRuntime implements CronRuntimeRef {
     reason: "startup" | "reload" | "new" | "resume" | "fork" = "startup",
   ): Promise<void> {
     return this.serialize(async () => {
+      const generation = ++this.generation;
       await this.stopInternal();
       this.ctx = ctx;
       const store = new PiEventStore(this.pi, ctx.sessionManager);
@@ -130,17 +138,22 @@ export class CronRuntime implements CronRuntimeRef {
         idFactory: () => makeJobId(),
       });
       this.lease = this.leaseFactory();
-      const acquired = await this.lease.acquire(
-        ctx.sessionManager.getSessionId(),
-      );
+      let acquired: { owned: true } | { owned: false; owner: LeaseRecord };
+      try {
+        acquired = await this.lease.acquire(ctx.sessionManager.getSessionId());
+      } catch (error) {
+        await this.enterRecovery(generation, error, false);
+        this.refreshUi();
+        return;
+      }
       this.readOnlyOwner = acquired.owned ? undefined : acquired.owner;
       if (acquired.owned) {
         await this.classifyResume(reason);
         this.buildExecutors(ctx);
         this.scheduler?.start();
-        this.heartbeatHandle = this.setIntervalFn(() => {
-          void this.heartbeat().catch((error) => this.loseLease(error));
-        }, 30_000);
+        this.startHeartbeat(generation);
+      } else {
+        await this.enterRecovery(generation, undefined, false);
       }
       this.refreshUi();
     });
@@ -148,8 +161,10 @@ export class CronRuntime implements CronRuntimeRef {
 
   stop(ctx?: ExtensionContext): Promise<void> {
     return this.serialize(async () => {
+      ++this.generation;
+      const currentCtx = ctx ?? this.ctx;
       await this.stopInternal();
-      (ctx ?? this.ctx)?.ui.setStatus("pi-cron", undefined);
+      currentCtx?.ui.setStatus("pi-cron", undefined);
     });
   }
 
@@ -293,10 +308,14 @@ export class CronRuntime implements CronRuntimeRef {
   }
 
   private async stopInternal(): Promise<void> {
-    if (this.heartbeatHandle !== undefined) {
-      this.clearIntervalFn(this.heartbeatHandle);
-      this.heartbeatHandle = undefined;
+    this.clearHeartbeat();
+    if (this.recoveryHandle !== undefined) {
+      this.clock.clearTimeout(this.recoveryHandle);
+      this.recoveryHandle = undefined;
     }
+    this.recoveryAttempt = 0;
+    this.retryExistingLease = false;
+    this.lossNotified = false;
     const scheduler = this.scheduler;
     const isolated = this.isolatedExecutor;
     const service = this.service;
@@ -446,20 +465,145 @@ export class CronRuntime implements CronRuntimeRef {
     }
   }
 
-  private async heartbeat(): Promise<void> {
-    await this.lease?.heartbeat();
+  private startHeartbeat(generation: number): void {
+    this.clearHeartbeat();
+    this.heartbeatHandle = this.setIntervalFn(() => {
+      void this.serialize(() => this.handleHeartbeat(generation)).catch(
+        (error) => this.notifyError(error),
+      );
+    }, 30_000);
   }
 
-  private loseLease(error: unknown): void {
-    if (this.heartbeatHandle !== undefined) {
-      this.clearIntervalFn(this.heartbeatHandle);
-      this.heartbeatHandle = undefined;
+  private clearHeartbeat(): void {
+    if (this.heartbeatHandle === undefined) return;
+    this.clearIntervalFn(this.heartbeatHandle);
+    this.heartbeatHandle = undefined;
+  }
+
+  private async handleHeartbeat(generation: number): Promise<void> {
+    if (generation !== this.generation || !this.lease || !this.scheduler) {
+      return;
     }
-    this.scheduler?.stop();
-    this.scheduler = undefined;
+    try {
+      await this.lease.heartbeat();
+    } catch (error) {
+      await this.enterRecovery(generation, error, true);
+    }
+  }
+
+  private async enterRecovery(
+    generation: number,
+    _error: unknown,
+    previouslyOwned: boolean,
+  ): Promise<void> {
+    if (generation !== this.generation) return;
+    this.clearHeartbeat();
+    const scheduler = this.scheduler;
+    scheduler?.stop();
     this.mainExecutor?.abortPending("runtime lease ownership lost");
-    void this.isolatedExecutor?.abortAll();
-    this.notifyError(error);
+    await this.isolatedExecutor?.abortAll();
+    await scheduler?.waitForIdle();
+    if (generation !== this.generation) return;
+    this.scheduler = undefined;
+    this.mainExecutor = undefined;
+    this.isolatedExecutor = undefined;
+    this.promptResolver = undefined;
+    if (previouslyOwned && !this.lossNotified) {
+      this.lossNotified = true;
+      this.ctx?.ui.notify(
+        "pi-cron: runtime lease lost; scheduling stopped; automatic recovery started",
+        "error",
+      );
+    }
+    this.recoveryAttempt = 0;
+    this.retryExistingLease = previouslyOwned;
+    this.scheduleRecovery(generation);
+    this.refreshUi();
+  }
+
+  private scheduleRecovery(generation: number): void {
+    if (
+      generation !== this.generation ||
+      this.recoveryHandle !== undefined ||
+      !this.ctx
+    ) {
+      return;
+    }
+    const delay =
+      RECOVERY_DELAYS_MS[
+        Math.min(this.recoveryAttempt, RECOVERY_DELAYS_MS.length - 1)
+      ];
+    const handle = this.clock.setTimeout(() => {
+      if (this.recoveryHandle === handle) this.recoveryHandle = undefined;
+      void this.serialize(() => this.attemptRecovery(generation)).catch(
+        (error) => this.notifyError(error),
+      );
+    }, delay);
+    this.recoveryHandle = handle;
+  }
+
+  private async attemptRecovery(generation: number): Promise<void> {
+    if (generation !== this.generation || !this.ctx) return;
+    const ctx = this.ctx;
+
+    if (this.retryExistingLease && this.lease) {
+      this.retryExistingLease = false;
+      try {
+        await this.lease.heartbeat();
+        await this.resumeOwnedRuntime(ctx, generation);
+        return;
+      } catch {
+        if (generation !== this.generation) return;
+      }
+    }
+
+    const candidate = this.leaseFactory();
+    let acquired: { owned: true } | { owned: false; owner: LeaseRecord };
+    try {
+      acquired = await candidate.acquire(ctx.sessionManager.getSessionId());
+    } catch {
+      this.recoveryAttempt += 1;
+      this.scheduleRecovery(generation);
+      return;
+    }
+    if (generation !== this.generation) {
+      if (acquired.owned) await candidate.release();
+      return;
+    }
+    if (!acquired.owned) {
+      this.lease = candidate;
+      this.readOnlyOwner = acquired.owner;
+      this.recoveryAttempt += 1;
+      this.scheduleRecovery(generation);
+      this.refreshUi();
+      return;
+    }
+
+    this.lease = candidate;
+    try {
+      await this.resumeOwnedRuntime(ctx, generation);
+    } catch {
+      await candidate.release();
+      if (this.lease === candidate) this.lease = undefined;
+      this.recoveryAttempt += 1;
+      this.scheduleRecovery(generation);
+    }
+  }
+
+  private async resumeOwnedRuntime(
+    ctx: ExtensionContext,
+    generation: number,
+  ): Promise<void> {
+    if (generation !== this.generation) return;
+    await this.classifyResume("reload");
+    if (generation !== this.generation) return;
+    this.buildExecutors(ctx);
+    this.scheduler?.start();
+    this.startHeartbeat(generation);
+    this.readOnlyOwner = undefined;
+    this.recoveryAttempt = 0;
+    this.retryExistingLease = false;
+    this.lossNotified = false;
     this.refreshUi();
   }
 
