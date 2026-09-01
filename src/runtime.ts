@@ -59,6 +59,16 @@ interface LeasePort {
 
 const GENERATION_CANCELLED = Symbol("generation-cancelled");
 
+class RecoveryRebuildError extends Error {
+  constructor(
+    cause: unknown,
+    readonly cleanupComplete: boolean,
+  ) {
+    super("Recovered runtime rebuild failed", { cause });
+    this.name = "RecoveryRebuildError";
+  }
+}
+
 interface RecoveryCleanup {
   scheduler: Scheduler | undefined;
   isolatedExecutor: IsolatedExecutor | undefined;
@@ -598,8 +608,12 @@ export class CronRuntime implements CronRuntimeRef {
         try {
           await this.rebuildOwnedRuntime(ctx, generation);
           return;
-        } catch {
-          await this.prepareOwnedLeaseRetry(existing, generation);
+        } catch (error) {
+          await this.prepareOwnedLeaseRetry(
+            existing,
+            generation,
+            error instanceof RecoveryRebuildError && !error.cleanupComplete,
+          );
           return;
         }
       }
@@ -632,8 +646,12 @@ export class CronRuntime implements CronRuntimeRef {
     this.lease = candidate;
     try {
       await this.rebuildOwnedRuntime(ctx, generation);
-    } catch {
-      await this.prepareOwnedLeaseRetry(candidate, generation);
+    } catch (error) {
+      await this.prepareOwnedLeaseRetry(
+        candidate,
+        generation,
+        error instanceof RecoveryRebuildError && !error.cleanupComplete,
+      );
     }
   }
 
@@ -692,10 +710,16 @@ export class CronRuntime implements CronRuntimeRef {
   private async prepareOwnedLeaseRetry(
     lease: LeasePort,
     generation: number,
+    cleanupPending = false,
   ): Promise<void> {
     if (generation !== this.generation) return;
     this.lease = lease;
     this.releaseLeaseBeforeAcquire = true;
+    if (cleanupPending || this.recoveryCleanup) {
+      this.recoveryAttempt += 1;
+      this.scheduleRecovery(generation);
+      return;
+    }
     const released = await this.releasePendingLease(generation);
     if (!released || generation !== this.generation) return;
     this.recoveryAttempt += 1;
@@ -803,8 +827,8 @@ export class CronRuntime implements CronRuntimeRef {
     } catch (error) {
       this.clearHeartbeat();
       this.beginRecoveryCleanup();
-      await this.finishRecoveryCleanup(generation);
-      throw error;
+      const cleanupComplete = await this.finishRecoveryCleanup(generation);
+      throw new RecoveryRebuildError(error, cleanupComplete);
     }
     this.readOnlyOwner = undefined;
     this.recoveryAttempt = 0;

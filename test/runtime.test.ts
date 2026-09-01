@@ -8,6 +8,7 @@ import type {
   SavedDefinitionStore,
 } from "../src/domain/saved.js";
 import type { CronEvent, CronJob } from "../src/domain/types.js";
+import { IsolatedExecutor } from "../src/execution/isolated-executor.js";
 import piCron from "../src/index.js";
 import { CronRuntime } from "../src/runtime.js";
 import { FakeClock } from "./helpers/fakes.js";
@@ -819,6 +820,42 @@ describe("CronRuntime", () => {
     expect(replacement.acquired).toEqual(["session-1"]);
     expect(configured.runtime.getScheduler()).toBeDefined();
     expect(configured.intervals.size).toBe(1);
+  });
+
+  it("retains the recovered lease until failed rollback cleanup succeeds", async () => {
+    const acquired = new FakeLease({ owned: true });
+    const replacement = new FakeLease({ owned: true });
+    const abortAll = vi
+      .spyOn(IsolatedExecutor.prototype, "abortAll")
+      .mockRejectedValueOnce(new Error("rollback cleanup failed"))
+      .mockResolvedValue(undefined);
+    try {
+      const configured = setup({
+        entries: [],
+        leases: [new FakeLease(OTHER_OWNER), acquired, replacement],
+        setIntervalErrors: [new Error("heartbeat installation failed")],
+      });
+      await configured.start();
+
+      configured.clock.advanceBy(5_000);
+      await configured.flushLifecycle();
+
+      expect(abortAll).toHaveBeenCalledTimes(1);
+      expect(acquired.releases).toBe(0);
+      expect(replacement.acquired).toEqual([]);
+      expect(configured.runtime.getScheduler()).toBeUndefined();
+      expect(configured.clock.pendingTimerCount()).toBe(1);
+
+      configured.clock.advanceBy(10_000);
+      await configured.flushLifecycle();
+
+      expect(abortAll).toHaveBeenCalledTimes(2);
+      expect(acquired.releases).toBe(1);
+      expect(replacement.acquired).toEqual(["session-1"]);
+      expect(configured.runtime.getScheduler()).toBeDefined();
+    } finally {
+      abortAll.mockRestore();
+    }
   });
 
   it("keeps recovered scheduling owned when recovery UI reporting throws", async () => {
