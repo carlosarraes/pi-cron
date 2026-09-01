@@ -495,7 +495,7 @@ export class CronRuntime implements CronRuntimeRef {
     this.clearHeartbeat();
     this.heartbeatHandle = this.setIntervalFn(() => {
       void this.serialize(() => this.handleHeartbeat(generation)).catch(
-        (error) => this.notifyError(error),
+        (error) => this.notifyErrorSafely(error),
       );
     }, 30_000);
   }
@@ -532,14 +532,14 @@ export class CronRuntime implements CronRuntimeRef {
     this.recoveryAttempt = 0;
     this.retryExistingLease = previouslyOwned;
     this.releaseLeaseBeforeAcquire = false;
+    this.beginRecoveryCleanup();
     if (previouslyOwned && !this.lossNotified) {
       this.lossNotified = true;
-      this.ctx?.ui.notify(
+      this.notifySafely(
         "pi-cron: runtime lease lost; scheduling stopped; automatic recovery started",
         "error",
       );
     }
-    this.beginRecoveryCleanup();
     const cleaned = await this.finishRecoveryCleanup(generation);
     if (generation !== this.generation) return;
     if (!cleaned) {
@@ -566,7 +566,7 @@ export class CronRuntime implements CronRuntimeRef {
     const handle = this.clock.setTimeout(() => {
       if (this.recoveryHandle === handle) this.recoveryHandle = undefined;
       void this.serialize(() => this.attemptRecovery(generation)).catch(
-        (error) => this.notifyError(error),
+        (error) => this.notifyErrorSafely(error),
       );
     }, delay);
     this.recoveryHandle = handle;
@@ -606,6 +606,8 @@ export class CronRuntime implements CronRuntimeRef {
       if (generation !== this.generation) return;
       if (heartbeatSucceeded) {
         try {
+          await this.service?.flushCheckpoint();
+          if (generation !== this.generation) return;
           await this.rebuildOwnedRuntime(ctx, generation);
           return;
         } catch (error) {
@@ -620,6 +622,7 @@ export class CronRuntime implements CronRuntimeRef {
     }
 
     const candidate = this.leaseFactory();
+    this.lease = candidate;
     let acquired: LeaseResult | undefined;
     try {
       acquired = await this.acquireForGeneration(
@@ -628,7 +631,14 @@ export class CronRuntime implements CronRuntimeRef {
         generation,
       );
     } catch {
-      if (generation !== this.generation) return;
+      if (generation !== this.generation) {
+        this.releaseLateOwnedLease(candidate);
+        return;
+      }
+      this.lease = candidate;
+      this.releaseLeaseBeforeAcquire = true;
+      const released = await this.releasePendingLease(generation);
+      if (!released || generation !== this.generation) return;
       this.recoveryAttempt += 1;
       this.scheduleRecovery(generation);
       return;
@@ -700,7 +710,9 @@ export class CronRuntime implements CronRuntimeRef {
       .then(async (result) => {
         if (result.owned) await lease.release();
       })
-      .catch(() => undefined);
+      .catch(async () => {
+        await lease.release().catch(() => undefined);
+      });
   }
 
   private releaseLateOwnedLease(lease: LeasePort): void {
@@ -742,11 +754,7 @@ export class CronRuntime implements CronRuntimeRef {
     } catch (error) {
       if (!this.cleanupErrorNotified) {
         this.cleanupErrorNotified = true;
-        try {
-          this.notifyError(error);
-        } catch {
-          // UI reporting cannot make recovery cleanup unsafe.
-        }
+        this.notifyErrorSafely(error);
       }
     }
   }
@@ -761,7 +769,7 @@ export class CronRuntime implements CronRuntimeRef {
       if (generation !== this.generation) return false;
       if (!this.cleanupErrorNotified) {
         this.cleanupErrorNotified = true;
-        this.notifyError(error);
+        this.notifyErrorSafely(error);
       }
       return false;
     }
@@ -837,14 +845,10 @@ export class CronRuntime implements CronRuntimeRef {
     this.recoveryCleanup = undefined;
     this.cleanupErrorNotified = false;
     this.lossNotified = false;
-    try {
-      ctx.ui.notify(
-        "pi-cron: runtime lease recovered; scheduling resumed",
-        "info",
-      );
-    } catch {
-      // UI reporting is outside the lease-ownership transaction.
-    }
+    this.notifySafely(
+      "pi-cron: runtime lease recovered; scheduling resumed",
+      "info",
+    );
     try {
       this.refreshUi();
     } catch (error) {
@@ -860,6 +864,19 @@ export class CronRuntime implements CronRuntimeRef {
     if (!this.ctx || !this.service) return;
     this.scheduler?.refresh();
     updateCronStatus(this.ctx, this.service, this.scheduler, this.clock.now());
+  }
+
+  private notifySafely(message: string, level: "error" | "info"): void {
+    try {
+      this.ctx?.ui.notify(message, level);
+    } catch {
+      // UI reporting cannot change lease ownership or recovery state.
+    }
+  }
+
+  private notifyErrorSafely(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    this.notifySafely(`pi-cron: ${message}`, "error");
   }
 
   private notifyError(error: unknown): void {

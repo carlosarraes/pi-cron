@@ -162,6 +162,7 @@ function setup(
     notificationErrors?: Error[];
     statusErrors?: Error[];
     setIntervalErrors?: Error[];
+    mirrorAppendsToEntries?: boolean;
   } = {},
 ) {
   const entries = options.entries ?? [];
@@ -202,6 +203,9 @@ function setup(
       const error = appendErrors.shift();
       if (error) throw error;
       appended.push({ type, data });
+      if (options.mirrorAppendsToEntries) {
+        entries.push({ type: "custom", customType: type, data });
+      }
     },
     sendUserMessage: (prompt: string) => sent.push(prompt),
     sendMessage: vi.fn(),
@@ -483,6 +487,81 @@ describe("CronRuntime", () => {
     expect(lease.heartbeats).toBe(2);
     expect(configured.runtime.getScheduler()).toBeDefined();
     expect(configured.intervals.size).toBe(1);
+  });
+
+  it("stops scheduling and arms recovery when the loss notification throws", async () => {
+    const lease = new FakeLease({
+      acquire: [{ owned: true }],
+      heartbeat: [new Error("lost")],
+    });
+    const configured = setup({
+      entries: [],
+      leases: [lease],
+      notificationErrors: [new Error("notification failed")],
+    });
+    await configured.start();
+
+    await configured.fireHeartbeat();
+
+    expect(configured.runtime.getScheduler()).toBeUndefined();
+    expect(configured.intervals.size).toBe(0);
+    expect(configured.clock.pendingTimerCount()).toBe(1);
+  });
+
+  it("checkpoints an aborted main run before same-lease rehydration", async () => {
+    const lease = new FakeLease({
+      acquire: [{ owned: true }],
+      heartbeat: [new Error("temporary"), undefined],
+    });
+    const configured = setup({
+      entries: [customEntry(event())],
+      leases: [lease],
+      mirrorAppendsToEntries: true,
+    });
+    await configured.start();
+    await settleAsync();
+    expect(configured.sent).toEqual(["Run report"]);
+
+    await configured.fireHeartbeat();
+    configured.clock.advanceBy(5_000);
+    await configured.flushLifecycle();
+    await settleAsync();
+
+    const recovered = configured.runtime.requireService().get("job-1");
+    expect(configured.sent).toEqual(["Run report"]);
+    expect(recovered?.runCount).toBe(1);
+    expect(recovered?.lastOccurrenceAt).toBeDefined();
+    expect(
+      configured.appended.some(
+        (entry) =>
+          entry.type === "pi-cron/event" &&
+          (entry.data as CronEvent).type === "metrics_checkpoint",
+      ),
+    ).toBe(true);
+  });
+
+  it("releases an ambiguous failed acquisition before trying another lease", async () => {
+    const ambiguous = new FakeLease({
+      acquire: [new Error("publish cleanup failed")],
+      release: [new Error("release busy"), undefined],
+    });
+    const replacement = new FakeLease({ owned: true });
+    const configured = setup({
+      entries: [],
+      leases: [new FakeLease(OTHER_OWNER), ambiguous, replacement],
+    });
+    await configured.start();
+
+    configured.clock.advanceBy(5_000);
+    await configured.flushLifecycle();
+    expect(ambiguous.releases).toBe(1);
+    expect(replacement.acquired).toEqual([]);
+
+    configured.clock.advanceBy(10_000);
+    await configured.flushLifecycle();
+    expect(ambiguous.releases).toBe(2);
+    expect(replacement.acquired).toEqual(["session-1"]);
+    expect(configured.runtime.getScheduler()).toBeDefined();
   });
 
   it("switches to a fresh lease after genuine ownership loss", async () => {
