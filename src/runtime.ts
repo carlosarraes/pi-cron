@@ -49,13 +49,15 @@ class SystemClock implements Clock {
   }
 }
 
+type LeaseResult = { owned: true } | { owned: false; owner: LeaseRecord };
+
 interface LeasePort {
-  acquire(
-    sessionId: string,
-  ): Promise<{ owned: true } | { owned: false; owner: LeaseRecord }>;
+  acquire(sessionId: string): Promise<LeaseResult>;
   heartbeat(): Promise<void>;
   release(): Promise<void>;
 }
+
+const GENERATION_CANCELLED = Symbol("generation-cancelled");
 
 interface RecoveryCleanup {
   scheduler: Scheduler | undefined;
@@ -96,6 +98,7 @@ export class CronRuntime implements CronRuntimeRef {
   private recoveryCleanup: RecoveryCleanup | undefined;
   private cleanupErrorNotified = false;
   private generation = 0;
+  private generationAbortController = new AbortController();
   private lossNotified = false;
   private ctx: ExtensionContext | undefined;
   private readOnlyOwner: LeaseRecord | undefined;
@@ -124,20 +127,30 @@ export class CronRuntime implements CronRuntimeRef {
     ctx: ExtensionContext,
     reason: "startup" | "reload" | "new" | "resume" | "fork" = "startup",
   ): Promise<void> {
+    const generation = this.advanceGeneration();
     return this.serialize(async () => {
-      const generation = ++this.generation;
+      if (generation !== this.generation) return;
       await this.stopInternal();
+      if (generation !== this.generation) return;
       this.ctx = ctx;
       this.rebuildServices(ctx);
-      this.lease = this.leaseFactory();
-      let acquired: { owned: true } | { owned: false; owner: LeaseRecord };
+      const candidate = this.leaseFactory();
+      let acquired: LeaseResult | undefined;
       try {
-        acquired = await this.lease.acquire(ctx.sessionManager.getSessionId());
+        acquired = await this.acquireForGeneration(
+          candidate,
+          ctx.sessionManager.getSessionId(),
+          generation,
+        );
       } catch (error) {
+        if (generation !== this.generation) return;
+        this.lease = candidate;
         await this.enterRecovery(generation, error, false);
         this.refreshUi();
         return;
       }
+      if (!acquired || generation !== this.generation) return;
+      this.lease = candidate;
       this.readOnlyOwner = acquired.owned ? undefined : acquired.owner;
       if (acquired.owned) {
         await this.classifyResume(reason);
@@ -152,8 +165,8 @@ export class CronRuntime implements CronRuntimeRef {
   }
 
   stop(ctx?: ExtensionContext): Promise<void> {
+    this.advanceGeneration();
     return this.serialize(async () => {
-      ++this.generation;
       const currentCtx = ctx ?? this.ctx;
       await this.stopInternal();
       currentCtx?.ui.setStatus("pi-cron", undefined);
@@ -297,6 +310,13 @@ export class CronRuntime implements CronRuntimeRef {
     const run = this.lifecycle.then(operation, operation);
     this.lifecycle = run.catch(() => undefined);
     return run;
+  }
+
+  private advanceGeneration(): number {
+    this.generationAbortController.abort();
+    this.generationAbortController = new AbortController();
+    this.generation += 1;
+    return this.generation;
   }
 
   private async stopInternal(): Promise<void> {
@@ -481,8 +501,13 @@ export class CronRuntime implements CronRuntimeRef {
       return;
     }
     try {
-      await this.lease.heartbeat();
+      const result = await this.waitForGeneration(
+        this.lease.heartbeat(),
+        generation,
+      );
+      if (result === GENERATION_CANCELLED) return;
     } catch (error) {
+      if (generation !== this.generation) return;
       await this.enterRecovery(generation, error, true);
     }
   }
@@ -559,7 +584,11 @@ export class CronRuntime implements CronRuntimeRef {
       const existing = this.lease;
       let heartbeatSucceeded = false;
       try {
-        await existing.heartbeat();
+        const result = await this.waitForGeneration(
+          existing.heartbeat(),
+          generation,
+        );
+        if (result === GENERATION_CANCELLED) return;
         heartbeatSucceeded = true;
       } catch {
         if (generation !== this.generation) return;
@@ -577,24 +606,20 @@ export class CronRuntime implements CronRuntimeRef {
     }
 
     const candidate = this.leaseFactory();
-    let acquired: { owned: true } | { owned: false; owner: LeaseRecord };
+    let acquired: LeaseResult | undefined;
     try {
-      acquired = await candidate.acquire(ctx.sessionManager.getSessionId());
+      acquired = await this.acquireForGeneration(
+        candidate,
+        ctx.sessionManager.getSessionId(),
+        generation,
+      );
     } catch {
+      if (generation !== this.generation) return;
       this.recoveryAttempt += 1;
       this.scheduleRecovery(generation);
       return;
     }
-    if (generation !== this.generation) {
-      if (acquired.owned) {
-        try {
-          await candidate.release();
-        } catch {
-          // The replacement generation owns teardown from this point.
-        }
-      }
-      return;
-    }
+    if (!acquired || generation !== this.generation) return;
     if (!acquired.owned) {
       this.lease = candidate;
       this.readOnlyOwner = acquired.owner;
@@ -610,6 +635,58 @@ export class CronRuntime implements CronRuntimeRef {
     } catch {
       await this.prepareOwnedLeaseRetry(candidate, generation);
     }
+  }
+
+  private async waitForGeneration<T>(
+    operation: Promise<T>,
+    generation: number,
+  ): Promise<T | typeof GENERATION_CANCELLED> {
+    if (generation !== this.generation) return GENERATION_CANCELLED;
+    const signal = this.generationAbortController.signal;
+    if (signal.aborted) return GENERATION_CANCELLED;
+    let cancel: (() => void) | undefined;
+    const cancelled = new Promise<typeof GENERATION_CANCELLED>((resolve) => {
+      cancel = () => resolve(GENERATION_CANCELLED);
+      signal.addEventListener("abort", cancel, { once: true });
+    });
+    try {
+      return await Promise.race([operation, cancelled]);
+    } finally {
+      if (cancel) signal.removeEventListener("abort", cancel);
+    }
+  }
+
+  private async acquireForGeneration(
+    lease: LeasePort,
+    sessionId: string,
+    generation: number,
+  ): Promise<LeaseResult | undefined> {
+    const acquisition = lease.acquire(sessionId);
+    const result = await this.waitForGeneration(acquisition, generation);
+    if (result === GENERATION_CANCELLED) {
+      this.releaseLateAcquisition(acquisition, lease);
+      return undefined;
+    }
+    if (generation !== this.generation) {
+      if (result.owned) this.releaseLateOwnedLease(lease);
+      return undefined;
+    }
+    return result;
+  }
+
+  private releaseLateAcquisition(
+    acquisition: Promise<LeaseResult>,
+    lease: LeasePort,
+  ): void {
+    void acquisition
+      .then(async (result) => {
+        if (result.owned) await lease.release();
+      })
+      .catch(() => undefined);
+  }
+
+  private releaseLateOwnedLease(lease: LeasePort): void {
+    void lease.release().catch(() => undefined);
   }
 
   private async prepareOwnedLeaseRetry(
@@ -628,14 +705,26 @@ export class CronRuntime implements CronRuntimeRef {
   private beginRecoveryCleanup(): void {
     if (this.recoveryCleanup) return;
     const scheduler = this.scheduler;
+    const mainExecutor = this.mainExecutor;
     const isolatedExecutor = this.isolatedExecutor;
-    scheduler?.stop();
-    this.mainExecutor?.abortPending("runtime lease ownership lost");
     this.scheduler = undefined;
     this.mainExecutor = undefined;
     this.isolatedExecutor = undefined;
     this.promptResolver = undefined;
     this.recoveryCleanup = { scheduler, isolatedExecutor };
+    try {
+      scheduler?.stop();
+      mainExecutor?.abortPending("runtime lease ownership lost");
+    } catch (error) {
+      if (!this.cleanupErrorNotified) {
+        this.cleanupErrorNotified = true;
+        try {
+          this.notifyError(error);
+        } catch {
+          // UI reporting cannot make recovery cleanup unsafe.
+        }
+      }
+    }
   }
 
   private async finishRecoveryCleanup(generation: number): Promise<boolean> {
@@ -703,13 +792,20 @@ export class CronRuntime implements CronRuntimeRef {
     generation: number,
   ): Promise<void> {
     if (generation !== this.generation) return;
-    this.rebuildServices(ctx);
-    if (generation !== this.generation) return;
-    await this.classifyResume("reload");
-    if (generation !== this.generation) return;
-    this.buildExecutors(ctx);
-    this.scheduler?.start();
-    this.startHeartbeat(generation);
+    try {
+      this.rebuildServices(ctx);
+      if (generation !== this.generation) return;
+      await this.classifyResume("reload");
+      if (generation !== this.generation) return;
+      this.buildExecutors(ctx);
+      this.scheduler?.start();
+      this.startHeartbeat(generation);
+    } catch (error) {
+      this.clearHeartbeat();
+      this.beginRecoveryCleanup();
+      await this.finishRecoveryCleanup(generation);
+      throw error;
+    }
     this.readOnlyOwner = undefined;
     this.recoveryAttempt = 0;
     this.retryExistingLease = false;
@@ -717,11 +813,23 @@ export class CronRuntime implements CronRuntimeRef {
     this.recoveryCleanup = undefined;
     this.cleanupErrorNotified = false;
     this.lossNotified = false;
-    ctx.ui.notify(
-      "pi-cron: runtime lease recovered; scheduling resumed",
-      "info",
-    );
-    this.refreshUi();
+    try {
+      ctx.ui.notify(
+        "pi-cron: runtime lease recovered; scheduling resumed",
+        "info",
+      );
+    } catch {
+      // UI reporting is outside the lease-ownership transaction.
+    }
+    try {
+      this.refreshUi();
+    } catch (error) {
+      try {
+        this.notifyError(error);
+      } catch {
+        // UI reporting cannot revoke proven lease ownership.
+      }
+    }
   }
 
   private refreshUi(): void {

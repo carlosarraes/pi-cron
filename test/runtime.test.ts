@@ -158,6 +158,9 @@ function setup(
     savedDefinitions?: SavedCronDefinition[];
     trusted?: boolean;
     appendErrors?: Error[];
+    notificationErrors?: Error[];
+    statusErrors?: Error[];
+    setIntervalErrors?: Error[];
   } = {},
 ) {
   const entries = options.entries ?? [];
@@ -169,6 +172,9 @@ function setup(
   const notificationLevels: Array<string | undefined> = [];
   const savedDefinitions = structuredClone(options.savedDefinitions ?? []);
   const appendErrors = [...(options.appendErrors ?? [])];
+  const notificationErrors = [...(options.notificationErrors ?? [])];
+  const statusErrors = [...(options.statusErrors ?? [])];
+  const setIntervalErrors = [...(options.setIntervalErrors ?? [])];
   const savedStore: SavedDefinitionStore = {
     list: async () => {
       if (options.trusted === false)
@@ -215,9 +221,14 @@ function setup(
     isProjectTrusted: () => options.trusted ?? true,
     getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
     ui: {
-      setStatus: (_key: string, value: string | undefined) =>
-        statuses.push(value),
+      setStatus: (_key: string, value: string | undefined) => {
+        const error = statusErrors.shift();
+        if (error) throw error;
+        statuses.push(value);
+      },
       notify: (message: string, level?: string) => {
+        const error = notificationErrors.shift();
+        if (error) throw error;
         notifications.push(message);
         notificationLevels.push(level);
       },
@@ -235,6 +246,8 @@ function setup(
     leaseFactory: () =>
       leases[Math.min(leaseFactoryIndex++, leases.length - 1)] as FakeLease,
     setInterval: (fn) => {
+      const error = setIntervalErrors.shift();
+      if (error) throw error;
       const id = nextInterval++;
       intervals.set(id, fn);
       return id;
@@ -258,6 +271,9 @@ function setup(
     leases,
     savedDefinitions,
     savedStore,
+    notificationErrors,
+    statusErrors,
+    setIntervalErrors,
     start: () => runtime.start(ctx, options.reason ?? "startup"),
     fireHeartbeat: async () => {
       const heartbeat = [...intervals.values()][0];
@@ -678,6 +694,50 @@ describe("CronRuntime", () => {
     expect(configured.runtime.getScheduler()).toBeDefined();
   });
 
+  it("reload fences an in-flight recovery acquisition before it resolves", async () => {
+    const acquisition = deferred<FakeLeaseResult>();
+    const staleCandidate = new FakeLease({ acquire: [acquisition.promise] });
+    const reloaded = new FakeLease({ owned: true });
+    const configured = setup({
+      entries: [],
+      leases: [new FakeLease(OTHER_OWNER), staleCandidate, reloaded],
+    });
+    await configured.start();
+    configured.clock.advanceBy(5_000);
+    await settleAsync();
+    expect(staleCandidate.acquired).toEqual(["session-1"]);
+
+    await configured.runtime.start(configured.ctx, "reload");
+
+    acquisition.resolve({ owned: true });
+    await settleAsync();
+    expect(reloaded.acquired).toEqual(["session-1"]);
+    expect(staleCandidate.releases).toBeGreaterThanOrEqual(1);
+    expect(configured.runtime.getScheduler()).toBeDefined();
+    expect(configured.notifications).toEqual([]);
+  });
+
+  it("shutdown fences an in-flight recovery acquisition before it resolves", async () => {
+    const acquisition = deferred<FakeLeaseResult>();
+    const staleCandidate = new FakeLease({ acquire: [acquisition.promise] });
+    const configured = setup({
+      entries: [],
+      leases: [new FakeLease(OTHER_OWNER), staleCandidate],
+    });
+    await configured.start();
+    configured.clock.advanceBy(5_000);
+    await settleAsync();
+
+    await configured.runtime.stop(configured.ctx);
+
+    acquisition.resolve({ owned: true });
+    await settleAsync();
+    expect(staleCandidate.releases).toBeGreaterThanOrEqual(1);
+    expect(configured.runtime.getScheduler()).toBeUndefined();
+    expect(configured.clock.pendingTimerCount()).toBe(0);
+    expect(configured.notifications).toEqual([]);
+  });
+
   it("releases an acquired lease when rehydration fails, then retries", async () => {
     const acquired = new FakeLease({ owned: true });
     const replacement = new FakeLease({ owned: true });
@@ -733,6 +793,50 @@ describe("CronRuntime", () => {
     await settleAsync();
     expect(replacement.acquired).toEqual([]);
     expect(configured.runtime.getScheduler()).toBeUndefined();
+    expect(configured.clock.pendingTimerCount()).toBe(0);
+  });
+
+  it("rolls back a partially started recovered runtime before releasing its lease", async () => {
+    const acquired = new FakeLease({ owned: true });
+    const replacement = new FakeLease({ owned: true });
+    const configured = setup({
+      entries: [],
+      leases: [new FakeLease(OTHER_OWNER), acquired, replacement],
+      setIntervalErrors: [new Error("heartbeat installation failed")],
+    });
+    await configured.start();
+
+    configured.clock.advanceBy(5_000);
+    await configured.flushLifecycle();
+
+    expect(acquired.releases).toBe(1);
+    expect(configured.runtime.getScheduler()).toBeUndefined();
+    expect(configured.intervals.size).toBe(0);
+    expect(configured.clock.pendingTimerCount()).toBe(1);
+
+    configured.clock.advanceBy(10_000);
+    await configured.flushLifecycle();
+    expect(replacement.acquired).toEqual(["session-1"]);
+    expect(configured.runtime.getScheduler()).toBeDefined();
+    expect(configured.intervals.size).toBe(1);
+  });
+
+  it("keeps recovered scheduling owned when recovery UI reporting throws", async () => {
+    const acquired = new FakeLease({ owned: true });
+    const configured = setup({
+      entries: [],
+      leases: [new FakeLease(OTHER_OWNER), acquired],
+      notificationErrors: [new Error("notification failed")],
+    });
+    await configured.start();
+    configured.statusErrors.push(new Error("status failed"));
+
+    configured.clock.advanceBy(5_000);
+    await configured.flushLifecycle();
+
+    expect(acquired.releases).toBe(0);
+    expect(configured.runtime.getScheduler()).toBeDefined();
+    expect(configured.intervals.size).toBe(1);
     expect(configured.clock.pendingTimerCount()).toBe(0);
   });
 
