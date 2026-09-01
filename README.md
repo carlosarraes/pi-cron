@@ -184,10 +184,22 @@ Model names may be exact `provider/id` values or unique fuzzy matches. Unsupport
 - Scheduled runs cannot recursively create cron jobs or create, copy, update, delete, or start saved definitions. Adaptive wakeup/self-stop is the only scheduling mutation allowed during a scheduled execution.
 - All jobs share global cron concurrency of one.
 - With the default `queue` overlap policy, repeated occurrences coalesce into one pending run. With `skip`, ticks due while that same job is running are dropped and counted. Pending jobs drain oldest-first without catch-up bursts.
-- A per-session lease under Pi's agent directory prevents two Pi processes from scheduling the same session. The non-owner remains read-only.
+- A per-session lease under Pi's agent directory prevents two Pi processes from scheduling the same session. The non-owner remains read-only while automatic recovery waits for safe ownership.
 - Shutdown clears timers, aborts isolated work, checkpoints metrics, releases the lease, and clears footer state.
 
 Manual approval previews show the full prompt or maintenance source, schedule and exact next run, timezone, execution environment, resources, notification behavior, expiry/caps, timeout, failure limit, credentials warning, and configuration fingerprint. Automatically accepted LLM mutations retain the approval timestamp and configuration fingerprint for auditing.
+
+## Lease recovery
+
+A transient lease heartbeat failure stops scheduling immediately, then pi-cron retries the existing lease once. If ownership cannot be proven, it retries with fresh lease instances after 5s, 10s, 20s, and then every 30s. A runtime that starts as the non-owner follows the same automatic retry path. Another live owner is never preempted; takeover occurs only after that owner releases the lease or its heartbeat becomes stale.
+
+Scheduling and write operations remain stopped/read-only until ownership is proven. After takeover, pi-cron reloads the latest session events before rebuilding services and restarting the scheduler. Occurrences missed during recovery are not replayed or turned into catch-up bursts.
+
+If scheduling is read-only after a lease error, pi-cron retries automatically.
+Use /reload for an immediate runtime rebuild; do not navigate /tree solely to
+recover scheduling. Another live owner must release or stale before takeover.
+
+`/reload` is the immediate manual fallback because it rebuilds the extension runtime and reacquires the lease safely. `cron_list` reports persisted job state, so an idle-looking list alone does not prove that this process owns the lease or that its scheduler is running.
 
 ## Maintenance prompt
 
