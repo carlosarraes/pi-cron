@@ -87,6 +87,7 @@ export class CronRuntime implements CronRuntimeRef {
   private recoveryHandle: unknown;
   private recoveryAttempt = 0;
   private retryExistingLease = false;
+  private releaseLeaseBeforeAcquire = false;
   private generation = 0;
   private lossNotified = false;
   private ctx: ExtensionContext | undefined;
@@ -315,6 +316,7 @@ export class CronRuntime implements CronRuntimeRef {
     }
     this.recoveryAttempt = 0;
     this.retryExistingLease = false;
+    this.releaseLeaseBeforeAcquire = false;
     this.lossNotified = false;
     const scheduler = this.scheduler;
     const isolated = this.isolatedExecutor;
@@ -517,6 +519,7 @@ export class CronRuntime implements CronRuntimeRef {
     }
     this.recoveryAttempt = 0;
     this.retryExistingLease = previouslyOwned;
+    this.releaseLeaseBeforeAcquire = false;
     this.scheduleRecovery(generation);
     this.refreshUi();
   }
@@ -546,14 +549,30 @@ export class CronRuntime implements CronRuntimeRef {
     if (generation !== this.generation || !this.ctx) return;
     const ctx = this.ctx;
 
+    if (this.releaseLeaseBeforeAcquire) {
+      const released = await this.releasePendingLease(generation);
+      if (!released || generation !== this.generation) return;
+    }
+
     if (this.retryExistingLease && this.lease) {
       this.retryExistingLease = false;
+      const existing = this.lease;
+      let heartbeatSucceeded = false;
       try {
-        await this.lease.heartbeat();
-        await this.resumeOwnedRuntime(ctx, generation);
-        return;
+        await existing.heartbeat();
+        heartbeatSucceeded = true;
       } catch {
         if (generation !== this.generation) return;
+      }
+      if (generation !== this.generation) return;
+      if (heartbeatSucceeded) {
+        try {
+          await this.resumeOwnedRuntime(ctx, generation);
+          return;
+        } catch {
+          await this.prepareOwnedLeaseRetry(existing, generation);
+          return;
+        }
       }
     }
 
@@ -567,7 +586,13 @@ export class CronRuntime implements CronRuntimeRef {
       return;
     }
     if (generation !== this.generation) {
-      if (acquired.owned) await candidate.release();
+      if (acquired.owned) {
+        try {
+          await candidate.release();
+        } catch {
+          // The replacement generation owns teardown from this point.
+        }
+      }
       return;
     }
     if (!acquired.owned) {
@@ -583,11 +608,41 @@ export class CronRuntime implements CronRuntimeRef {
     try {
       await this.resumeOwnedRuntime(ctx, generation);
     } catch {
-      await candidate.release();
-      if (this.lease === candidate) this.lease = undefined;
+      await this.prepareOwnedLeaseRetry(candidate, generation);
+    }
+  }
+
+  private async prepareOwnedLeaseRetry(
+    lease: LeasePort,
+    generation: number,
+  ): Promise<void> {
+    if (generation !== this.generation) return;
+    this.lease = lease;
+    this.releaseLeaseBeforeAcquire = true;
+    const released = await this.releasePendingLease(generation);
+    if (!released || generation !== this.generation) return;
+    this.recoveryAttempt += 1;
+    this.scheduleRecovery(generation);
+  }
+
+  private async releasePendingLease(generation: number): Promise<boolean> {
+    const pending = this.lease;
+    if (!pending) {
+      this.releaseLeaseBeforeAcquire = false;
+      return true;
+    }
+    try {
+      await pending.release();
+    } catch {
+      if (generation !== this.generation) return false;
       this.recoveryAttempt += 1;
       this.scheduleRecovery(generation);
+      return false;
     }
+    if (generation !== this.generation) return false;
+    if (this.lease === pending) this.lease = undefined;
+    this.releaseLeaseBeforeAcquire = false;
+    return true;
   }
 
   private async resumeOwnedRuntime(
@@ -603,6 +658,7 @@ export class CronRuntime implements CronRuntimeRef {
     this.readOnlyOwner = undefined;
     this.recoveryAttempt = 0;
     this.retryExistingLease = false;
+    this.releaseLeaseBeforeAcquire = false;
     this.lossNotified = false;
     this.refreshUi();
   }

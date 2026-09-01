@@ -95,6 +95,7 @@ class FakeLease {
   releases = 0;
   private readonly acquireSteps: Array<FakeLeaseResult | Error>;
   private readonly heartbeatSteps: Array<undefined | Error>;
+  private readonly releaseSteps: Array<undefined | Error>;
   private readonly defaultAcquire: FakeLeaseResult;
 
   constructor(
@@ -103,15 +104,18 @@ class FakeLease {
       | {
           acquire?: Array<FakeLeaseResult | Error>;
           heartbeat?: Array<undefined | Error>;
+          release?: Array<undefined | Error>;
         } = { owned: true },
   ) {
     if ("owned" in script) {
       this.acquireSteps = [script];
       this.heartbeatSteps = [];
+      this.releaseSteps = [];
       this.defaultAcquire = script;
     } else {
       this.acquireSteps = [...(script.acquire ?? [{ owned: true }])];
       this.heartbeatSteps = [...(script.heartbeat ?? [])];
+      this.releaseSteps = [...(script.release ?? [])];
       const lastAcquire = this.acquireSteps.at(-1);
       this.defaultAcquire =
         lastAcquire instanceof Error || lastAcquire === undefined
@@ -135,6 +139,8 @@ class FakeLease {
 
   async release(): Promise<void> {
     this.releases += 1;
+    const step = this.releaseSteps.shift();
+    if (step instanceof Error) throw step;
   }
 }
 
@@ -147,6 +153,7 @@ function setup(
     reason?: "startup" | "reload" | "new" | "resume" | "fork";
     savedDefinitions?: SavedCronDefinition[];
     trusted?: boolean;
+    appendErrors?: Error[];
   } = {},
 ) {
   const entries = options.entries ?? [];
@@ -156,6 +163,7 @@ function setup(
   const statuses: Array<string | undefined> = [];
   const notifications: string[] = [];
   const savedDefinitions = structuredClone(options.savedDefinitions ?? []);
+  const appendErrors = [...(options.appendErrors ?? [])];
   const savedStore: SavedDefinitionStore = {
     list: async () => {
       if (options.trusted === false)
@@ -178,7 +186,11 @@ function setup(
     },
   };
   const pi = {
-    appendEntry: (type: string, data: unknown) => appended.push({ type, data }),
+    appendEntry: (type: string, data: unknown) => {
+      const error = appendErrors.shift();
+      if (error) throw error;
+      appended.push({ type, data });
+    },
     sendUserMessage: (prompt: string) => sent.push(prompt),
     sendMessage: vi.fn(),
     getCommands: () => [],
@@ -516,6 +528,86 @@ describe("CronRuntime", () => {
     configured.clock.advanceBy(1);
     await configured.flushLifecycle();
     expect(configured.leases[2]?.acquired).toEqual(["session-1"]);
+    expect(configured.runtime.getScheduler()).toBeDefined();
+  });
+
+  it("releases a proven existing lease when runtime resume fails", async () => {
+    const previous = new FakeLease({
+      acquire: [{ owned: true }],
+      heartbeat: [new Error("temporary"), undefined],
+    });
+    const replacement = new FakeLease({ owned: true });
+    const configured = setup({
+      entries: [
+        customEntry(
+          event(
+            job({
+              schedule: {
+                kind: "cron",
+                expression: "0 0 * * *",
+                timezone: "UTC",
+              },
+              expiresAt: "2026-07-15T10:00:01.000Z",
+            }),
+          ),
+        ),
+      ],
+      leases: [previous, replacement],
+      appendErrors: [new Error("session append failed")],
+    });
+    await configured.start();
+
+    await configured.fireHeartbeat();
+    configured.clock.advanceBy(5_000);
+    await configured.flushLifecycle();
+
+    expect(previous.releases).toBe(1);
+    expect(replacement.acquired).toEqual([]);
+    expect(configured.runtime.getScheduler()).toBeUndefined();
+    expect(configured.clock.pendingTimerCount()).toBe(1);
+
+    configured.clock.advanceBy(10_000);
+    await configured.flushLifecycle();
+    expect(replacement.acquired).toEqual(["session-1"]);
+    expect(configured.runtime.getScheduler()).toBeDefined();
+  });
+
+  it("keeps retrying owned-lease cleanup when release fails", async () => {
+    const acquired = new FakeLease({
+      acquire: [{ owned: true }],
+      release: [new Error("release lock busy"), undefined],
+    });
+    const replacement = new FakeLease({ owned: true });
+    const configured = setup({
+      entries: [
+        customEntry(
+          event(
+            job({
+              schedule: {
+                kind: "cron",
+                expression: "0 0 * * *",
+                timezone: "UTC",
+              },
+              expiresAt: "2026-07-15T10:00:01.000Z",
+            }),
+          ),
+        ),
+      ],
+      leases: [new FakeLease(OTHER_OWNER), acquired, replacement],
+      appendErrors: [new Error("session append failed")],
+    });
+    await configured.start();
+
+    configured.clock.advanceBy(5_000);
+    await configured.flushLifecycle();
+    expect(acquired.releases).toBe(1);
+    expect(replacement.acquired).toEqual([]);
+    expect(configured.clock.pendingTimerCount()).toBe(1);
+
+    configured.clock.advanceBy(10_000);
+    await configured.flushLifecycle();
+    expect(acquired.releases).toBe(2);
+    expect(replacement.acquired).toEqual(["session-1"]);
     expect(configured.runtime.getScheduler()).toBeDefined();
   });
 
