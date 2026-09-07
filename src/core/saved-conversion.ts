@@ -22,6 +22,7 @@ export function savedDraftFromJobDraft(
     prompt: structuredClone(draft.prompt),
     schedule: savedScheduleFromRuntime(draft.schedule),
     execution: structuredClone(draft.execution ?? { kind: "main" }),
+    ...(draft.afterRun !== undefined ? { afterRun: draft.afterRun } : {}),
     overlap: draft.overlap ?? "queue",
     unsafeSeconds:
       draft.unsafeSeconds === true || isSubMinuteRecurring(draft.schedule),
@@ -42,6 +43,7 @@ export function savedDraftFromJob(job: CronJob): SavedDefinitionDraft {
     prompt: structuredClone(job.prompt),
     schedule: savedScheduleFromRuntime(job.schedule),
     execution: structuredClone(job.execution),
+    ...(job.afterRun !== undefined ? { afterRun: job.afterRun } : {}),
     overlap: job.overlap ?? "queue",
     unsafeSeconds: isSubMinuteRecurring(job.schedule),
     expiresAfterMs: expiryDuration(job.expiresAt, Date.parse(job.createdAt)),
@@ -67,6 +69,7 @@ export function savedPatchFromJobPatch(
   if (Object.hasOwn(patch, "execution") && patch.execution !== undefined) {
     result.execution = structuredClone(patch.execution);
   }
+  if (Object.hasOwn(patch, "afterRun")) result.afterRun = patch.afterRun;
   if (Object.hasOwn(patch, "overlap")) result.overlap = patch.overlap;
   if (Object.hasOwn(patch, "expiresAt") && patch.expiresAt !== undefined) {
     result.expiresAfterMs = expiryDuration(patch.expiresAt, now.getTime());
@@ -96,6 +99,9 @@ export function materializeSavedDefinition(
     prompt: structuredClone(definition.prompt),
     schedule: materializeSchedule(definition.schedule, now),
     execution: structuredClone(definition.execution),
+    ...(definition.afterRun !== undefined
+      ? { afterRun: definition.afterRun }
+      : {}),
     overlap: definition.overlap,
     expiresAt,
     unsafeSeconds: definition.unsafeSeconds,

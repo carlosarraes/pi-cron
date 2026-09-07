@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { nextOccurrence } from "../domain/schedule.js";
 import type {
   Clock,
@@ -27,6 +28,13 @@ export interface SchedulerOptions {
   dispatcher: Dispatcher;
   clock: Clock;
   onError?: (error: unknown) => void;
+  onRunRecorded?: (job: CronJob, result: DispatchResult) => void;
+}
+
+export interface SchedulerSnapshot {
+  pending: Array<[string, string]>;
+  occurrences: Array<[string, string]>;
+  initialQueued: string[];
 }
 
 export interface NextDue {
@@ -40,6 +48,7 @@ export class Scheduler {
   private readonly service: SchedulerService;
   private readonly dispatcher: Dispatcher;
   private readonly clock: Clock;
+  private readonly onRunRecorded: SchedulerOptions["onRunRecorded"];
   private readonly onError: (error: unknown) => void;
   private readonly occurrences = new Map<string, Date>();
   private readonly pending = new Map<string, Date>();
@@ -49,12 +58,63 @@ export class Scheduler {
   private runningStartedAt: Date | undefined;
   private activeDrain: Promise<void> | undefined;
   private started = false;
+  private suspendedForHandoff = false;
+  private handoffSchedules = new Map<string, CronJob["schedule"]>();
 
   constructor(options: SchedulerOptions) {
     this.service = options.service;
     this.dispatcher = options.dispatcher;
     this.clock = options.clock;
+    this.onRunRecorded = options.onRunRecorded;
     this.onError = options.onError ?? (() => undefined);
+  }
+
+  suspendForHandoff(): void {
+    if (this.suspendedForHandoff) return;
+    this.suspendedForHandoff = true;
+    this.handoffSchedules = new Map(
+      this.service.list().map((job) => [job.id, structuredClone(job.schedule)]),
+    );
+    this.clearTimer();
+  }
+
+  snapshot(): SchedulerSnapshot {
+    let occurrences = this.occurrences;
+    if (this.suspendedForHandoff) {
+      occurrences = new Map();
+      const now = this.clock.now();
+      for (const job of this.service.list()) {
+        if (!isEligible(job, now)) continue;
+        // Accepted edits may finish after suspension. Recompute their future ticks,
+        // but retain actual queued work and elapsed ticks from unchanged schedules.
+        const unchanged = isDeepStrictEqual(
+          this.handoffSchedules.get(job.id),
+          job.schedule,
+        );
+        const next =
+          (unchanged ? this.occurrences.get(job.id) : undefined) ??
+          nextOccurrence(job.schedule, now);
+        if (next) occurrences.set(job.id, next);
+      }
+    }
+    return {
+      pending: [...this.pending].map(([id, at]) => [id, at.toISOString()]),
+      occurrences: [...occurrences].map(([id, at]) => [id, at.toISOString()]),
+      initialQueued: [...this.initialQueued],
+    };
+  }
+
+  restore(snapshot: SchedulerSnapshot): void {
+    for (const [id, at] of snapshot.pending) this.pending.set(id, new Date(at));
+    for (const [id, at] of snapshot.occurrences) {
+      if (
+        Date.parse(at) <= this.clock.now().getTime() &&
+        !this.pending.has(id)
+      ) {
+        this.pending.set(id, new Date(at));
+      }
+    }
+    for (const id of snapshot.initialQueued) this.initialQueued.add(id);
   }
 
   start(): void {
@@ -69,9 +129,11 @@ export class Scheduler {
     this.occurrences.clear();
     this.pending.clear();
     this.initialQueued.clear();
+    this.handoffSchedules.clear();
   }
 
   refresh(): void {
+    if (this.suspendedForHandoff) return;
     this.clearTimer();
     this.occurrences.clear();
     if (!this.started) return;
@@ -120,6 +182,8 @@ export class Scheduler {
   }
 
   async runNow(jobId: string): Promise<void> {
+    if (this.suspendedForHandoff)
+      throw new Error("Cron scheduling is closed for session handoff");
     const job = this.service.get(jobId);
     if (!job) throw new Error(`Cron job '${jobId}' not found`);
     if (job.state !== "active") {
@@ -176,7 +240,7 @@ export class Scheduler {
   }
 
   private async onTimer(): Promise<void> {
-    if (!this.started) return;
+    if (!this.started || this.suspendedForHandoff) return;
     const now = this.clock.now();
     const due = [...this.occurrences.entries()].filter(
       ([, at]) => at.getTime() <= now.getTime(),
@@ -201,6 +265,7 @@ export class Scheduler {
   }
 
   private requestDrain(): Promise<void> {
+    if (this.suspendedForHandoff) return this.activeDrain ?? Promise.resolve();
     if (this.activeDrain) return this.activeDrain;
     const run = this.drain();
     this.activeDrain = run;
@@ -212,9 +277,18 @@ export class Scheduler {
   }
 
   private async drain(): Promise<void> {
-    if (this.runningJobId || !this.dispatcher.isIdle()) return;
+    if (
+      this.suspendedForHandoff ||
+      this.runningJobId ||
+      !this.dispatcher.isIdle()
+    )
+      return;
 
-    while (!this.runningJobId && this.dispatcher.isIdle()) {
+    while (
+      !this.suspendedForHandoff &&
+      !this.runningJobId &&
+      this.dispatcher.isIdle()
+    ) {
       const next = [...this.pending.entries()]
         .map(([jobId, at]) => ({ jobId, at }))
         .sort(compareDue)[0];
@@ -229,6 +303,7 @@ export class Scheduler {
       try {
         const result = await this.dispatcher.execute(job, next.at);
         await this.service.recordRun(job.id, result, next.at);
+        this.onRunRecorded?.(job, result);
         if (this.service.shouldFlushCheckpoint(CHECKPOINT_POLICY)) {
           await this.service.flushCheckpoint();
         }

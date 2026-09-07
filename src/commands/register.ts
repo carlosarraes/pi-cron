@@ -55,6 +55,7 @@ export interface CreationFields {
   timezone?: string;
   execution?: ExecutionDraft;
   overlap?: CronJob["overlap"];
+  afterRun?: CronJob["afterRun"];
   expires?: string;
   maxRuns?: number;
   tokenBudget?: number;
@@ -272,6 +273,7 @@ function fromCreateInput(input: CreateInput): CreationFields {
     schedule: input.schedule,
     execution: input.execution,
     overlap: input.overlap,
+    afterRun: input.afterRun,
     expires: input.expires,
     maxRuns: input.maxRuns,
     tokenBudget: input.tokenBudget,
@@ -297,6 +299,7 @@ export function buildJobDraft(
     ),
     execution: resolveExecution(pi, ctx, input.execution),
     overlap: input.overlap,
+    afterRun: input.afterRun,
     expiresAt: resolveExpiry(input.expires, now),
     maxRuns: input.maxRuns,
     tokenBudget: input.tokenBudget,
@@ -332,6 +335,7 @@ export function buildJobPatch(
       current?.execution,
     );
   }
+  if (patch.afterRun !== undefined) output.afterRun = patch.afterRun;
   if (patch.overlap !== undefined) output.overlap = patch.overlap;
   if (patch.expires !== undefined)
     output.expiresAt = resolveExpiry(patch.expires, now);
@@ -419,7 +423,7 @@ export function formatJobList(jobs: CronJob[]): string {
       const overlap = job.overlap ?? "queue";
       const skipped = job.skippedRuns ?? 0;
       const lastSkipped = job.lastSkippedAt ?? "never";
-      return `${job.id}  ${job.state.padEnd(9)}  ${job.name}  ${describeSchedule(job.schedule)}  ${formatListExecution(job)}  overlap=${overlap}  runs=${job.runCount}  skipped=${skipped}  lastSkipped=${lastSkipped}  last=${last}  settled=${settled}`;
+      return `${job.id}  ${job.state.padEnd(9)}  ${job.name}  ${describeSchedule(job.schedule)}  ${formatListExecution(job)}  overlap=${overlap}  afterRun=${job.afterRun ?? "none"}  runs=${job.runCount}  skipped=${skipped}  lastSkipped=${lastSkipped}  last=${last}  settled=${settled}`;
     })
     .join("\n");
 }
@@ -442,7 +446,7 @@ export function formatSavedDefinitionList(
   return definitions
     .map(
       (definition) =>
-        `${definition.id}  stopped  ${definition.name}  ${formatSavedSchedule(definition.schedule)}  ${formatSavedExecution(definition)}  overlap=${definition.overlap}  expiresAfter=${definition.expiresAfterMs}ms  maxRuns=${definition.maxRuns ?? "unbounded"}  budget=${definition.tokenBudget ?? "unbounded"}`,
+        `${definition.id}  stopped  ${definition.name}  ${formatSavedSchedule(definition.schedule)}  ${formatSavedExecution(definition)}  overlap=${definition.overlap}  afterRun=${definition.afterRun ?? "none"}  expiresAfter=${definition.expiresAfterMs}ms  maxRuns=${definition.maxRuns ?? "unbounded"}  budget=${definition.tokenBudget ?? "unbounded"}`,
     )
     .join("\n");
 }
@@ -455,6 +459,7 @@ export function formatSavedDefinition(definition: SavedCronDefinition): string {
     `Schedule: ${formatSavedSchedule(definition.schedule)}`,
     `Execution: ${formatSavedExecution(definition)}`,
     `Overlap: ${definition.overlap}`,
+    `After run: ${definition.afterRun ?? "none"}`,
     `Expires after: ${definition.expiresAfterMs}ms`,
     `Maximum runs: ${definition.maxRuns ?? "unbounded"}`,
     `Token budget: ${definition.tokenBudget ?? "unbounded"}`,
@@ -468,6 +473,7 @@ export function formatJob(job: CronJob): string {
     `Schedule: ${describeSchedule(job.schedule)}`,
     `Execution: ${job.execution.kind}`,
     `Overlap: ${job.overlap ?? "queue"}`,
+    `After run: ${job.afterRun ?? "none"}`,
     `Runs: ${job.runCount}`,
     `Skipped: ${job.skippedRuns ?? 0}`,
     `Last skipped: ${job.lastSkippedAt ?? "never"}`,

@@ -25,6 +25,12 @@ export const CreationFields = {
   timezone: Type.Optional(Type.String()),
   mode: Type.Optional(Mode),
   overlap: Type.Optional(Overlap),
+  afterRun: Type.Optional(
+    StringEnum(["none", "compact", "clear"] as const, {
+      description:
+        "After successful main-session runs: keep context, compact, or start a new session carrying cron jobs. Isolated jobs require none.",
+    }),
+  ),
   model: Type.Optional(Type.String()),
   effort: Type.Optional(Effort),
   notify: Type.Optional(Type.Boolean()),

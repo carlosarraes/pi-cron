@@ -1,3 +1,4 @@
+import { validateAfterRun } from "./policy.js";
 import { nextOccurrence } from "./schedule.js";
 import {
   type CronJob,
@@ -29,6 +30,7 @@ export interface SavedCronDefinition {
   schedule: SavedSchedule;
   execution: ExecutionMode;
   overlap: OverlapPolicy;
+  afterRun?: CronJob["afterRun"];
   unsafeSeconds: boolean;
   expiresAfterMs: number;
   maxRuns?: number;
@@ -181,6 +183,8 @@ export function requiresSavedReapproval(
   after: SavedCronDefinition,
 ): boolean {
   return (
+    ((after.afterRun ?? "none") !== "none" &&
+      (before.afterRun ?? "none") !== after.afterRun) ||
     JSON.stringify(before.prompt) !== JSON.stringify(after.prompt) ||
     savedScheduleRaisesPrivilege(before.schedule, after.schedule) ||
     after.expiresAfterMs > before.expiresAfterMs ||
@@ -209,6 +213,7 @@ function isSavedDefinitionShape(
     "schedule",
     "execution",
     "overlap",
+    "afterRun",
     "unsafeSeconds",
     "expiresAfterMs",
     "maxRuns",
@@ -229,6 +234,10 @@ function isSavedDefinitionShape(
     isPrompt(value.prompt) &&
     isSavedSchedule(value.schedule) &&
     isExecution(value.execution) &&
+    (value.afterRun === undefined ||
+      value.afterRun === "none" ||
+      value.afterRun === "compact" ||
+      value.afterRun === "clear") &&
     (value.overlap === "queue" || value.overlap === "skip") &&
     typeof value.unsafeSeconds === "boolean" &&
     isPositiveSafeInteger(value.expiresAfterMs) &&
@@ -350,6 +359,7 @@ function isApproval(value: unknown): value is CronJob["approval"] {
 function validateSavedSchedule(
   candidate: ProposedSavedCronDefinition | SavedCronDefinition,
 ): void {
+  validateAfterRun(candidate);
   const { schedule } = candidate;
   if (schedule.kind === "cron") {
     nextOccurrence(

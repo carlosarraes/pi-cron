@@ -1,4 +1,8 @@
-import type { ExecutionMode, OverlapPolicy } from "../domain/types.js";
+import type {
+  AfterRun,
+  ExecutionMode,
+  OverlapPolicy,
+} from "../domain/types.js";
 
 const DURATION = /^[1-9]\d*(?:s|m|h|d)$/;
 const SCHEDULE_FLAGS = [
@@ -16,6 +20,7 @@ const VALUE_FLAGS = new Set([
   "--prompt",
   "--name",
   "--overlap",
+  "--after-run",
   "--effort",
   "--expires",
   "--max-runs",
@@ -68,6 +73,7 @@ interface EditableFields {
   prompt?: string;
   name?: string;
   overlap?: OverlapPolicy;
+  afterRun?: AfterRun;
   execution?: ExecutionDraft;
   expires?: string;
   maxRuns?: number;
@@ -369,6 +375,14 @@ function draftFrom(flags: ParsedFlags): EditableDraft {
   copyString(flags, "--prompt", draft, "prompt");
   copyString(flags, "--name", draft, "name");
   copyString(flags, "--expires", draft, "expires");
+
+  const afterRun = stringFlag(flags, "--after-run");
+  if (afterRun !== undefined) {
+    if (afterRun !== "none" && afterRun !== "compact" && afterRun !== "clear") {
+      throw new CommandParseError(`Invalid --after-run: ${afterRun}`);
+    }
+    draft.afterRun = afterRun;
+  }
 
   const overlap = stringFlag(flags, "--overlap");
   if (overlap !== undefined) {

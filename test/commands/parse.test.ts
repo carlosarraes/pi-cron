@@ -257,3 +257,26 @@ describe("parseCronCommand", () => {
     expect(() => parseCronCommand(raw)).toThrowError(message);
   });
 });
+
+describe("after-run command option", () => {
+  it.each([
+    "none",
+    "compact",
+    "clear",
+  ])("parses %s for create and edits", (afterRun) => {
+    expect(
+      parseCronCommand(`add --every 5m --prompt check --after-run ${afterRun}`),
+    ).toMatchObject({ input: { afterRun } });
+    expect(
+      parseCronCommand(`edit report --after-run ${afterRun}`),
+    ).toMatchObject({ patch: { afterRun } });
+    expect(
+      parseCronCommand(`saved edit report --after-run ${afterRun}`),
+    ).toMatchObject({ patch: { afterRun } });
+  });
+  it("rejects unknown actions", () => {
+    expect(() => parseCronCommand("edit report --after-run reset")).toThrow(
+      /Invalid --after-run/,
+    );
+  });
+});

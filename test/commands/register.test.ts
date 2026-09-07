@@ -367,3 +367,25 @@ describe("registerCronCommand", () => {
     );
   });
 });
+
+it("passes after-run options through session and saved commands", async () => {
+  const { run, service, savedService } = setup();
+  await run("add --every 5m --prompt check --after-run compact");
+  expect(service.create).toHaveBeenCalledWith(
+    expect.objectContaining({ afterRun: "compact" }),
+  );
+  await run("edit Report --after-run clear");
+  expect(service.replace).toHaveBeenCalledWith(
+    "job-1",
+    expect.objectContaining({ afterRun: "clear" }),
+  );
+  await run("save add --every 5m --prompt check --after-run clear");
+  expect(savedService.create).toHaveBeenCalledWith(
+    expect.objectContaining({ afterRun: "clear" }),
+  );
+  await run("saved edit Report --after-run none");
+  expect(savedService.replace).toHaveBeenCalledWith(
+    "save-001",
+    expect.objectContaining({ afterRun: "none" }),
+  );
+});

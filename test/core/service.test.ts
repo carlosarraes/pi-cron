@@ -1004,3 +1004,58 @@ describe("CronService saved activation", () => {
     expect(store.appended).toEqual([]);
   });
 });
+
+describe("afterRun policy", () => {
+  it("defaults to none and persists create/update actions", async () => {
+    const { service, store } = makeService();
+    const created = await service.create(
+      validDraft({ execution: { kind: "main" } }),
+    );
+    expect(created.afterRun).toBe("none");
+    const updated = await service.replace(created.id, { afterRun: "clear" });
+    expect(updated.afterRun).toBe("clear");
+    expect(
+      makeService({ events: store.appended }).service.get(created.id)?.afterRun,
+    ).toBe("clear");
+  });
+  it("rejects isolated actions and switching an action-enabled job to isolated", async () => {
+    const { service } = makeService();
+    await expect(
+      service.create(validDraft({ afterRun: "compact" })),
+    ).rejects.toThrow(/isolated.*fresh/i);
+    const created = await service.create(
+      validDraft({ execution: { kind: "main" }, afterRun: "clear" }),
+    );
+    await expect(
+      service.replace(created.id, { execution: validDraft().execution }),
+    ).rejects.toThrow(/isolated.*fresh/i);
+  });
+  it("requires approval when enabling destructive post-run actions", async () => {
+    const { service, approvals } = makeService();
+    const created = await service.create(
+      validDraft({ execution: { kind: "main" } }),
+    );
+    await service.replace(created.id, { afterRun: "compact" });
+    expect(approvals.approve).toHaveBeenCalledTimes(2);
+  });
+});
+
+it("closes mutations only after draining accepted changes for session handoff", async () => {
+  const approval = deferred<CronJob["approval"]>();
+  const { service } = makeService({
+    events: [created()],
+    approvals: { approve: () => approval.promise },
+  });
+  const update = service.replace("abcd1234", {
+    prompt: { kind: "text", text: "Updated before shutdown" },
+  });
+  const paused = service.pause("abcd1234");
+  const closed = service.closeMutations();
+  await expect(service.delete("abcd1234")).rejects.toThrow(/handoff/i);
+  approval.resolve(APPROVAL);
+  await Promise.all([update, paused, closed]);
+  expect(service.get("abcd1234")).toMatchObject({
+    state: "paused",
+    prompt: { text: "Updated before shutdown" },
+  });
+});

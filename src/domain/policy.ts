@@ -51,6 +51,7 @@ export function validateJob(
   candidate: ProposedJob,
   jobs: Iterable<CronJob>,
 ): void {
+  validateAfterRun(candidate);
   const others = [...jobs].filter((job) => job.id !== candidate.id);
   if (others.length >= DEFAULT_LIMITS.maxJobs) {
     throw new Error(`Cron jobs are limited to ${DEFAULT_LIMITS.maxJobs}`);
@@ -66,6 +67,8 @@ export function validateJob(
 
 export function requiresReapproval(before: CronJob, after: CronJob): boolean {
   return (
+    ((after.afterRun ?? "none") !== "none" &&
+      (before.afterRun ?? "none") !== after.afterRun) ||
     promptFingerprint(before.prompt) !== promptFingerprint(after.prompt) ||
     scheduleRaisesPrivilege(before.schedule, after.schedule) ||
     expiryRaisesPrivilege(before.expiresAt, after.expiresAt) ||
@@ -165,4 +168,21 @@ function raisesLimit(
   if (before === undefined) return false;
   if (after === undefined) return true;
   return after > before;
+}
+
+export function validateAfterRun(
+  candidate: Pick<ProposedJob, "afterRun" | "execution">,
+): void {
+  if (
+    candidate.afterRun !== undefined &&
+    !["none", "compact", "clear"].includes(candidate.afterRun)
+  ) {
+    throw new Error("Invalid afterRun: choose none, compact, or clear");
+  }
+  if (
+    candidate.execution.kind === "isolated" &&
+    (candidate.afterRun ?? "none") !== "none"
+  ) {
+    throw new Error("Isolated jobs already start fresh; afterRun must be none");
+  }
 }

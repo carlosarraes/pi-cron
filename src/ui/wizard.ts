@@ -30,6 +30,7 @@ export interface WizardState {
   prompt: string;
   execution: ExecutionDraft;
   overlap: OverlapPolicy;
+  afterRun?: JobDraft["afterRun"];
   limits: LimitsDraft;
   error?: string;
   cancelled?: boolean;
@@ -66,6 +67,7 @@ export function initialWizardState(
     prompt: seed.prompt ?? "",
     execution: seed.execution ?? { kind: "main" },
     overlap: seed.overlap ?? "queue",
+    afterRun: seed.afterRun,
     limits: seed.limits ?? {},
     error: seed.error,
   };
@@ -319,6 +321,7 @@ function buildDraft(state: WizardState, now: Date): JobDraft {
     schedule: resolveSchedule(state.schedule, now),
     execution,
     overlap: state.overlap,
+    afterRun: state.afterRun,
     expiresAt: state.limits.expires
       ? parseExpiry(state.limits.expires, now)
       : undefined,

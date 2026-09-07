@@ -1,4 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import type { ActiveExecution } from "../core/service.js";
 import { parseDuration } from "../domain/schedule.js";
 import type { Clock, CronJob, DispatchResult } from "../domain/types.js";
@@ -117,13 +120,15 @@ export class MainExecutor {
     });
   }
 
-  async settle(): Promise<void> {
+  async settle(
+    outcome: "settled" | "failed" | "aborted" = "settled",
+  ): Promise<void> {
     const pending = this.pending;
     if (!pending) return;
 
     try {
       await this.applyAdaptiveFallback(pending);
-      this.finish({ outcome: "settled", tokens: this.usageDelta(pending) });
+      this.finish({ outcome, tokens: this.usageDelta(pending) });
     } catch (error) {
       this.finish({
         outcome: "failed",
@@ -239,4 +244,46 @@ export class MainExecutor {
 
 function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** A successful queued prompt must not erase a failure from the preceding prompt. */
+export function mainRunOutcome(
+  branch: readonly SessionEntry[],
+): "settled" | "failed" | "aborted" {
+  let start = -1;
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index];
+    if (
+      entry.type === "custom" &&
+      entry.customType === "pi-cron/run" &&
+      (entry.data as { kind?: string } | undefined)?.kind === "started"
+    ) {
+      start = index;
+      break;
+    }
+  }
+  let outcome: "settled" | "failed" | "aborted" = "settled";
+  let hasInput = start < 0;
+  for (const entry of branch.slice(start + 1)) {
+    if (
+      entry.type === "custom_message" ||
+      (entry.type === "message" && entry.message.role === "user")
+    ) {
+      if (start >= 0 && hasInput && outcome !== "settled") return outcome;
+      hasInput = true;
+    } else if (
+      hasInput &&
+      entry.type === "message" &&
+      entry.message.role === "assistant"
+    ) {
+      // Automatic retries keep the same input; success before the next input recovers the error.
+      outcome =
+        entry.message.stopReason === "error"
+          ? "failed"
+          : entry.message.stopReason === "aborted"
+            ? "aborted"
+            : "settled";
+    }
+  }
+  return outcome;
 }

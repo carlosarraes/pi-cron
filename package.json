@@ -25,16 +25,16 @@
   },
   "dependencies": { "croner": "^10.0.1" },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.80.0",
-    "@earendil-works/pi-coding-agent": ">=0.80.0",
-    "@earendil-works/pi-tui": ">=0.80.0",
+    "@earendil-works/pi-ai": ">=0.85.1",
+    "@earendil-works/pi-coding-agent": ">=0.85.1",
+    "@earendil-works/pi-tui": ">=0.85.1",
     "typebox": "*"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.8",
-    "@earendil-works/pi-ai": "^0.80.0",
-    "@earendil-works/pi-coding-agent": "^0.80.0",
-    "@earendil-works/pi-tui": "^0.80.0",
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-tui": "^0.85.1",
     "@types/node": "^24.0.0",
     "typebox": "^1.0.0",
     "typescript": "^6.0.0",

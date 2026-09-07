@@ -183,6 +183,7 @@ export function isCronJob(value: unknown): value is CronJob {
       "state",
       "execution",
       "overlap",
+      "afterRun",
       "createdAt",
       "updatedAt",
       "expiresAt",
@@ -216,6 +217,14 @@ export function isCronJob(value: unknown): value is CronJob {
       "overlap",
       (field) => field === "queue" || field === "skip",
     ) &&
+    hasOptionalField(
+      value,
+      "afterRun",
+      (field) => field === "none" || field === "compact" || field === "clear",
+    ) &&
+    (value.execution.kind !== "isolated" ||
+      value.afterRun === undefined ||
+      value.afterRun === "none") &&
     isString(value.createdAt) &&
     isString(value.updatedAt) &&
     isString(value.expiresAt) &&

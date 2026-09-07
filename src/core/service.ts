@@ -36,6 +36,7 @@ export interface JobDraft {
   schedule: Schedule;
   execution?: ExecutionMode;
   overlap?: OverlapPolicy;
+  afterRun?: CronJob["afterRun"];
   expiresAt?: string;
   maxRuns?: number;
   tokenBudget?: number;
@@ -90,6 +91,7 @@ export class CronService {
   private dirtyRunCount = 0;
   private dirtySinceMs: number | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
+  private mutationsClosed = false;
   private pendingMutationCount = 0;
   private changeNotificationPending = false;
 
@@ -426,6 +428,13 @@ export class CronService {
     );
   }
 
+  /** Drain accepted changes and reject late writers before transferring session state. */
+  closeMutations(): Promise<void> {
+    const drained = this.flushCheckpoint();
+    this.mutationsClosed = true;
+    return drained;
+  }
+
   flushCheckpoint(): Promise<void> {
     return this.enqueueMutation(() => {
       if (this.dirtySinceMs === undefined) return;
@@ -527,6 +536,10 @@ export class CronService {
   }
 
   private enqueueMutation<T>(operation: () => Promise<T> | T): Promise<T> {
+    if (this.mutationsClosed)
+      return Promise.reject(
+        new Error("Cron mutations are closed for session handoff"),
+      );
     this.pendingMutationCount += 1;
     const run = this.mutationTail.then(operation);
     this.mutationTail = run.then(
@@ -684,6 +697,7 @@ function buildProposedJob(
     state: "active",
     execution: structuredClone(draft.execution ?? { kind: "main" }),
     overlap: draft.overlap ?? "queue",
+    afterRun: draft.afterRun ?? "none",
     createdAt: timestamp,
     updatedAt: timestamp,
     expiresAt:
@@ -711,6 +725,7 @@ function applyPatch(before: CronJob, patch: JobPatch, now: Date): CronJob {
     schedule: structuredClone(patch.schedule ?? before.schedule),
     execution: structuredClone(patch.execution ?? before.execution),
     overlap: patch.overlap ?? before.overlap ?? "queue",
+    afterRun: patch.afterRun ?? before.afterRun ?? "none",
     expiresAt: patch.expiresAt ?? before.expiresAt,
     updatedAt: now.toISOString(),
   };

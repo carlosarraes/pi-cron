@@ -6,6 +6,8 @@ Session-scoped and project-saved scheduled prompts for Pi: fixed intervals, five
 
 ## Install
 
+Requires Pi 0.85.1 or newer for safe post-run session actions.
+
 ```bash
 pi install git:github.com/carlosarraes/pi-cron
 ```
@@ -51,6 +53,30 @@ A loaded skill or prompt template can be scheduled by name:
 ```
 
 Only currently loaded skills and prompt templates are schedulable. Built-in interactive commands and arbitrary extension commands are rejected.
+
+## After each run
+
+Each main-session job accepts `--after-run none|compact|clear`, defaulting to `none`:
+
+- `none` leaves the conversation unchanged.
+- `compact` uses Pi's compaction, retaining a summary and recent messages. It is not a blank session.
+- `clear` starts a new Pi session, like `/new`, without copying conversation history. All cron jobs, approvals, counters, limits, schedule anchors, adaptive wakeups, and queued ticks carry over. Saved-origin activations remain active.
+
+```text
+/cron add --every 20m --prompt "check CI" --after-run compact
+/cron edit check-ci --after-run clear
+/cron edit check-ci --after-run none
+/cron save add --every 1h --prompt "report status" --after-run clear
+/cron saved edit report --after-run compact
+```
+
+Agent tools accept the same setting as `afterRun: "none" | "compact" | "clear"` on `cron_create`, `cron_update`, `cron_saved_create`, and `cron_saved_update`. Copying and starting saved definitions preserve it. Use strict commands or tools to change this setting; the guided editor preserves the existing value.
+
+The action runs only after Pi fully settles, including tools, automatic retries, and queued follow-ups. Failed or aborted runs keep their context for diagnosis, even if a later queued prompt succeeds. A retry recovered before new input still counts as successful; uncertain recovery across new input keeps the context. Cron dispatch stays blocked until compaction or session replacement finishes. Cancellation or failure before the old session shuts down reports a notification and resumes scheduling without retrying the action. A replacement failure after shutdown is reported through Pi; the old scheduler cannot automatically resume. Its checkpoint remains in the old session for manual restoration. Deleting a job or changing its `afterRun` during execution cancels that run's action; the new value applies on the next run.
+
+These actions affect the whole main conversation, including non-cron messages. Pi's normal session history remains available through `/resume`; `clear` does not delete old session files. Isolated jobs already start with a fresh child session every run and reject any `afterRun` other than `none`.
+
+Manual `/new` still starts without carrying cron jobs. Only an approved job's after-run `clear` performs the handoff. The internal `/cron-after-run` command is a token-guarded implementation detail, not a user command.
 
 ## Guided creation
 

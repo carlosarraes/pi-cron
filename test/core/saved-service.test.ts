@@ -294,3 +294,35 @@ describe("SavedCronService", () => {
     expect(store.definitions).toEqual([]);
   });
 });
+
+describe("saved afterRun", () => {
+  it("persists actions and reapproves changes", async () => {
+    const { service, approve } = setup();
+    const created = await service.create(draft({ afterRun: "compact" }));
+    expect(created.afterRun).toBe("compact");
+    expect(
+      (await service.replace(created.id, { afterRun: "clear" })).afterRun,
+    ).toBe("clear");
+    expect(approve).toHaveBeenCalledTimes(2);
+  });
+  it("rejects isolated actions", async () => {
+    const { service } = setup();
+    await expect(
+      service.create(
+        draft({
+          afterRun: "clear",
+          execution: {
+            kind: "isolated",
+            model: "m",
+            effort: "off",
+            tools: [],
+            skills: [],
+            extensions: [],
+            notify: false,
+            timeoutMs: 60000,
+          },
+        }),
+      ),
+    ).rejects.toThrow(/isolated.*fresh/i);
+  });
+});

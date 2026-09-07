@@ -3,6 +3,7 @@ import {
   type ExtensionCommandContext,
   type ExtensionContext,
   getAgentDir,
+  type SessionShutdownEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
   type ExecutionDraft,
@@ -15,8 +16,14 @@ import { type LeaseRecord, RuntimeLease } from "./core/lease.js";
 import { ProjectCronStore } from "./core/project-cron-store.js";
 import { materializeSavedDefinition } from "./core/saved-conversion.js";
 import { SavedCronService } from "./core/saved-service.js";
-import { Scheduler } from "./core/scheduler.js";
+import { Scheduler, type SchedulerSnapshot } from "./core/scheduler.js";
 import { CronService, type JobDraft } from "./core/service.js";
+import {
+  AFTER_RUN_COMMAND,
+  CRON_HANDOFF_ENTRY,
+  type CronSessionHandoff,
+  readSessionHandoff,
+} from "./core/session-handoff.js";
 import { selectJob } from "./domain/policy.js";
 import type { SavedDefinitionStore } from "./domain/saved.js";
 import type {
@@ -28,7 +35,7 @@ import type {
 } from "./domain/types.js";
 import { makeJobId } from "./domain/types.js";
 import { IsolatedExecutor } from "./execution/isolated-executor.js";
-import { MainExecutor } from "./execution/main-executor.js";
+import { MainExecutor, mainRunOutcome } from "./execution/main-executor.js";
 import { PromptResolver } from "./execution/prompt-resolver.js";
 import { validateActivationResources } from "./execution/resource-validator.js";
 import { UiApprovalPort } from "./ui/approval.js";
@@ -112,6 +119,29 @@ export class CronRuntime implements CronRuntimeRef {
   private lossNotified = false;
   private ctx: ExtensionContext | undefined;
   private readOnlyOwner: LeaseRecord | undefined;
+  private afterRun:
+    | {
+        token: string;
+        generation: number;
+        sessionId: string;
+        jobId: string;
+        action: "compact" | "clear";
+        running: boolean;
+        timer?: unknown;
+      }
+    | undefined;
+  private handoff: CronSessionHandoff | undefined;
+  private handoffReleased = false;
+  private clearTransfer:
+    | {
+        closing: boolean;
+        snapshot?: {
+          jobs: CronJob[];
+          scheduler: SchedulerSnapshot;
+          at: string;
+        };
+      }
+    | undefined;
   private lifecycle: Promise<void> = Promise.resolve();
 
   constructor(pi: ExtensionAPI, dependencies: CronRuntimeDependencies = {}) {
@@ -143,6 +173,7 @@ export class CronRuntime implements CronRuntimeRef {
       await this.stopInternal();
       if (generation !== this.generation) return;
       this.ctx = ctx;
+      this.handoff = reason === "new" ? readSessionHandoff(ctx) : undefined;
       this.rebuildServices(ctx);
       const candidate = this.leaseFactory();
       let acquired: LeaseResult | undefined;
@@ -165,6 +196,7 @@ export class CronRuntime implements CronRuntimeRef {
       if (acquired.owned) {
         await this.classifyResume(reason);
         this.buildExecutors(ctx);
+        this.restoreHandoff();
         this.scheduler?.start();
         this.startHeartbeat(generation);
       } else {
@@ -174,7 +206,16 @@ export class CronRuntime implements CronRuntimeRef {
     });
   }
 
-  stop(ctx?: ExtensionContext): Promise<void> {
+  stop(
+    ctx?: ExtensionContext,
+    reason?: SessionShutdownEvent["reason"],
+  ): Promise<void> {
+    if (this.clearTransfer && (reason === undefined || reason === "new")) {
+      this.clearTransfer.closing = true;
+      this.scheduler?.suspendForHandoff();
+    } else {
+      this.clearTransfer = undefined;
+    }
     this.advanceGeneration();
     return this.serialize(async () => {
       const currentCtx = ctx ?? this.ctx;
@@ -185,7 +226,11 @@ export class CronRuntime implements CronRuntimeRef {
 
   onAgentSettled(ctx?: ExtensionContext): Promise<void> {
     return this.serialize(async () => {
-      await this.mainExecutor?.settle();
+      const current = ctx ?? this.ctx;
+      if (!current?.isIdle() || current.hasPendingMessages?.()) return;
+      await this.mainExecutor?.settle(
+        mainRunOutcome(current.sessionManager.getBranch()),
+      );
       await this.scheduler?.onAgentSettled();
       if (ctx) this.ctx = ctx;
       this.refreshUi();
@@ -323,6 +368,11 @@ export class CronRuntime implements CronRuntimeRef {
   }
 
   private advanceGeneration(): number {
+    if (this.afterRun?.timer !== undefined)
+      this.clock.clearTimeout(this.afterRun.timer);
+    this.afterRun = undefined;
+    this.handoff = undefined;
+    this.handoffReleased = false;
     this.generationAbortController.abort();
     this.generationAbortController = new AbortController();
     this.generation += 1;
@@ -339,6 +389,7 @@ export class CronRuntime implements CronRuntimeRef {
     this.retryExistingLease = false;
     this.releaseLeaseBeforeAcquire = false;
     this.lossNotified = false;
+    const transfer = this.clearTransfer;
     const recoveryCleanup = this.recoveryCleanup;
     const scheduler = this.scheduler ?? recoveryCleanup?.scheduler;
     const isolated = this.isolatedExecutor ?? recoveryCleanup?.isolatedExecutor;
@@ -353,7 +404,7 @@ export class CronRuntime implements CronRuntimeRef {
       }
     };
 
-    scheduler?.stop();
+    if (!transfer?.closing) scheduler?.stop();
     try {
       this.mainExecutor?.abortPending("session shutdown");
     } catch (error) {
@@ -361,7 +412,19 @@ export class CronRuntime implements CronRuntimeRef {
     }
     await attempt(async () => isolated?.abortAll());
     await attempt(async () => scheduler?.waitForIdle());
-    await attempt(async () => service?.flushCheckpoint());
+    if (transfer?.closing && service && scheduler) {
+      await attempt(async () => {
+        await service.closeMutations();
+        transfer.snapshot = {
+          jobs: service.list(),
+          scheduler: scheduler.snapshot(),
+          at: this.clock.now().toISOString(),
+        };
+      });
+      scheduler.stop();
+    } else {
+      await attempt(async () => service?.flushCheckpoint());
+    }
     await attempt(async () => lease?.release());
     this.ctx?.ui.setStatus("pi-cron", undefined);
     this.scheduler = undefined;
@@ -379,6 +442,7 @@ export class CronRuntime implements CronRuntimeRef {
   }
 
   private buildExecutors(ctx: ExtensionContext): void {
+    const generation = this.generation;
     const service = this.requireService();
     const resolver = new PromptResolver({
       pi: this.pi,
@@ -397,6 +461,8 @@ export class CronRuntime implements CronRuntimeRef {
     this.isolatedExecutor = this.createIsolatedExecutor(ctx, service, resolver);
     const dispatcher: Dispatcher = {
       isIdle: () =>
+        !this.afterRun &&
+        !this.handoff &&
         ctx.isIdle() &&
         (this.mainExecutor?.isIdle() ?? true) &&
         (this.isolatedExecutor?.isIdle() ?? true),
@@ -407,7 +473,166 @@ export class CronRuntime implements CronRuntimeRef {
       dispatcher,
       clock: this.clock,
       onError: (error) => this.notifyError(error),
+      onRunRecorded: (job, result) => {
+        if (generation === this.generation && this.service === service) {
+          this.queueAfterRun(job, result);
+        }
+      },
     });
+  }
+
+  private restoreHandoff(): void {
+    if (!this.handoff || !this.scheduler) return;
+    this.scheduler.restore(this.handoff.scheduler);
+    if (this.handoffReleased) this.handoff = undefined;
+  }
+
+  private queueAfterRun(job: CronJob, result: DispatchResult): void {
+    if (
+      !this.ctx ||
+      !this.scheduler ||
+      job.execution.kind !== "main" ||
+      result.outcome !== "settled" ||
+      !job.afterRun ||
+      job.afterRun === "none" ||
+      this.service?.get(job.id)?.afterRun !== job.afterRun ||
+      this.afterRun
+    )
+      return;
+    const pending = {
+      token: crypto.randomUUID(),
+      generation: this.generation,
+      sessionId: this.ctx.sessionManager.getSessionId(),
+      jobId: job.id,
+      action: job.afterRun,
+      running: false,
+      timer: undefined as unknown,
+    };
+    this.afterRun = pending;
+    // Leave agent_settled's event drain before invoking session-control APIs.
+    pending.timer = this.clock.setTimeout(() => {
+      if (this.afterRun !== pending || pending.generation !== this.generation)
+        return;
+      try {
+        this.pi.sendUserMessage(`/${AFTER_RUN_COMMAND} ${pending.token}`, {
+          deliverAs: "followUp",
+          expandPromptTemplates: true,
+        });
+      } catch (error) {
+        this.afterRun = undefined;
+        this.notifyErrorSafely(error);
+        this.refreshUi();
+      }
+    }, 0);
+  }
+
+  async completeAfterRun(
+    token: string,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> {
+    if (
+      this.handoff &&
+      token === `resume ${this.handoff.token}` &&
+      this.handoff.sessionId === ctx.sessionManager.getSessionId()
+    ) {
+      this.handoffReleased = true;
+      if (this.scheduler) this.handoff = undefined;
+      this.refreshUi();
+      return;
+    }
+    const pending = this.afterRun;
+    if (
+      !pending ||
+      pending.token !== token ||
+      pending.running ||
+      pending.generation !== this.generation ||
+      pending.sessionId !== ctx.sessionManager.getSessionId()
+    )
+      return;
+    pending.running = true;
+    const isCurrent = () =>
+      this.afterRun === pending && pending.generation === this.generation;
+    try {
+      const idle = await this.waitForGeneration(
+        ctx.waitForIdle(),
+        pending.generation,
+      );
+      if (idle === GENERATION_CANCELLED || !isCurrent()) return;
+      await this.scheduler?.waitForIdle();
+      if (
+        !isCurrent() ||
+        !this.scheduler ||
+        !ctx.isIdle() ||
+        ctx.hasPendingMessages?.()
+      )
+        return;
+      await this.requireService().flushCheckpoint();
+      if (
+        !isCurrent() ||
+        !this.scheduler ||
+        !ctx.isIdle() ||
+        ctx.hasPendingMessages?.()
+      )
+        return;
+      if (this.service?.get(pending.jobId)?.afterRun !== pending.action) return;
+      if (pending.action === "compact") {
+        await this.waitForGeneration(
+          new Promise<void>((resolve, reject) => {
+            ctx.compact({ onComplete: () => resolve(), onError: reject });
+          }),
+          pending.generation,
+        );
+      } else {
+        // Shutdown captures final state after before-switch hooks and accepted mutations finish.
+        // Only this plain-data container crosses replacement, never old Pi contexts.
+        const transfer: NonNullable<CronRuntime["clearTransfer"]> = {
+          closing: false,
+        };
+        this.clearTransfer = transfer;
+        const resumeToken = pending.token;
+        const result = await ctx.newSession({
+          setup: async (sm) => {
+            if (!transfer.snapshot)
+              throw new Error(
+                "Cron handoff snapshot was not captured during shutdown",
+              );
+            const { jobs, scheduler, at } = transfer.snapshot;
+            for (const job of jobs)
+              sm.appendCustomEntry("pi-cron/event", {
+                version: 1,
+                type: "job_created",
+                at,
+                job,
+              });
+            sm.appendCustomEntry(CRON_HANDOFF_ENTRY, {
+              version: 1,
+              sessionId: sm.getSessionId(),
+              token: resumeToken,
+              scheduler,
+            } satisfies CronSessionHandoff);
+          },
+          withSession: async (replacement) => {
+            await replacement.sendUserMessage(
+              `/${AFTER_RUN_COMMAND} resume ${resumeToken}`,
+              {
+                expandPromptTemplates: true,
+              },
+            );
+          },
+        });
+        if (result.cancelled && isCurrent())
+          this.notifySafely("pi-cron: after-run clear cancelled", "info");
+      }
+    } catch (error) {
+      if (isCurrent()) this.notifyErrorSafely(error);
+      else throw error;
+    } finally {
+      this.clearTransfer = undefined;
+      if (isCurrent()) {
+        this.afterRun = undefined;
+        this.refreshUi();
+      }
+    }
   }
 
   private createIsolatedExecutor(
@@ -480,7 +705,9 @@ export class CronRuntime implements CronRuntimeRef {
       } else if (
         job.schedule.kind === "once" &&
         Date.parse(job.schedule.at) <= now &&
-        job.runCount === 0
+        job.runCount === 0 &&
+        !this.handoff?.scheduler.pending.some(([id]) => id === job.id) &&
+        !this.handoff?.scheduler.occurrences.some(([id]) => id === job.id)
       ) {
         await service.transitionState(
           job.id,
@@ -831,6 +1058,7 @@ export class CronRuntime implements CronRuntimeRef {
       await this.classifyResume("reload");
       if (generation !== this.generation) return;
       this.buildExecutors(ctx);
+      this.restoreHandoff();
       this.scheduler?.start();
       this.startHeartbeat(generation);
     } catch (error) {
@@ -886,7 +1114,7 @@ export class CronRuntime implements CronRuntimeRef {
   }
 
   private requireWritable(): void {
-    if (this.readOnlyOwner || !this.scheduler) {
+    if (this.readOnlyOwner || !this.scheduler || this.clearTransfer?.closing) {
       throw new Error("Cron scheduler is read-only in this process");
     }
   }
@@ -936,6 +1164,7 @@ function seedFromJob(job: CronJob): Partial<WizardState> {
           : `/${job.prompt.name}${job.prompt.args ? ` ${job.prompt.args}` : ""}`,
     execution: executionDraftFromJob(job),
     overlap: job.overlap ?? "queue",
+    afterRun: job.afterRun ?? "none",
     limits: {
       expires: job.expiresAt,
       maxRuns: job.maxRuns,

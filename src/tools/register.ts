@@ -447,6 +447,7 @@ function creationFromTool(input: CronCreateInput): CreationFields {
     timezone: input.timezone,
     execution: executionFromTool(input),
     overlap: input.overlap,
+    afterRun: input.afterRun,
     expires: input.expires,
     maxRuns: input.maxRuns,
     tokenBudget: input.tokenBudget,
@@ -478,6 +479,7 @@ function patchFromTool(
       current.execution.kind === "isolated",
     );
   }
+  if (input.afterRun !== undefined) patch.afterRun = input.afterRun;
   if (input.overlap !== undefined) patch.overlap = input.overlap;
   if (input.expires !== undefined) patch.expires = input.expires;
   if (input.maxRuns !== undefined) patch.maxRuns = input.maxRuns;

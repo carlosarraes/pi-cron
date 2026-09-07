@@ -382,3 +382,18 @@ describe("saved patch conversion", () => {
     });
   });
 });
+
+it("carries afterRun through save, copy, patch and activation", () => {
+  expect(savedDraftFromJob(job({ afterRun: "clear" })).afterRun).toBe("clear");
+  expect(
+    savedDraftFromJobDraft(job({ afterRun: "compact" }), new Date(NOW))
+      .afterRun,
+  ).toBe("compact");
+  expect(savedPatchFromJobPatch({ afterRun: "none" }, new Date(NOW))).toEqual({
+    afterRun: "none",
+  });
+  expect(
+    materializeSavedDefinition(saved({ afterRun: "clear" }), new Date(NOW))
+      .afterRun,
+  ).toBe("clear");
+});

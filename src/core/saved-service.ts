@@ -156,6 +156,7 @@ function buildProposedDefinition(
     schedule: structuredClone(draft.schedule),
     execution: structuredClone(draft.execution),
     overlap: draft.overlap ?? "queue",
+    afterRun: draft.afterRun ?? "none",
     unsafeSeconds: draft.unsafeSeconds,
     expiresAfterMs: draft.expiresAfterMs,
     createdAt: now,
@@ -179,6 +180,7 @@ function applyPatch(
   copyRequiredPatch(after, patch, "schedule");
   copyRequiredPatch(after, patch, "execution");
   copyRequiredPatch(after, patch, "overlap");
+  copyRequiredPatch(after, patch, "afterRun");
   copyRequiredPatch(after, patch, "unsafeSeconds");
   copyRequiredPatch(after, patch, "expiresAfterMs");
   applyOptionalLimit(after, patch, "maxRuns");
@@ -193,6 +195,7 @@ function copyRequiredPatch<
     | "schedule"
     | "execution"
     | "overlap"
+    | "afterRun"
     | "unsafeSeconds"
     | "expiresAfterMs",
 >(target: SavedCronDefinition, patch: SavedDefinitionPatch, key: K): void {

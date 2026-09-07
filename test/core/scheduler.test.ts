@@ -604,3 +604,31 @@ describe("Scheduler", () => {
     expect(clock.pendingTimerCount()).toBe(1);
   });
 });
+
+it("reconciles suspended schedule edits while keeping pending and unchanged overdue ticks", async () => {
+  const f = harness([
+    job("edited", 10 * 60_000),
+    job("overdue", 60_000),
+    job("queued", 10 * 60_000),
+  ]);
+  f.dispatcher.idle = false;
+  f.scheduler.start();
+  await f.scheduler.runNow("queued");
+  f.scheduler.suspendForHandoff();
+  f.dispatcher.idle = true;
+  f.service.jobs.set("edited", job("edited", 5 * 60_000));
+  f.service.jobs.set("queued", job("queued", 60 * 60_000));
+  f.clock.advanceBy(2 * 60_000);
+  f.scheduler.refresh();
+  expect(f.dispatcher.calls).toEqual([]);
+  expect(f.clock.pendingTimerCount()).toBe(0);
+  expect(f.scheduler.snapshot()).toMatchObject({
+    pending: [["queued", NOW]],
+    occurrences: [
+      ["edited", "2026-07-15T10:05:00.000Z"],
+      ["overdue", "2026-07-15T10:01:00.000Z"],
+      ["queued", "2026-07-15T11:00:00.000Z"],
+    ],
+  });
+  f.scheduler.stop();
+});

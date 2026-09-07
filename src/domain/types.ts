@@ -19,6 +19,7 @@ export type Schedule =
     };
 
 export type JobState = "active" | "paused" | "missed" | "completed" | "expired";
+export type AfterRun = "none" | "compact" | "clear";
 export type OverlapPolicy = "queue" | "skip";
 export type TechnicalOutcome =
   | "dispatched"
@@ -57,6 +58,7 @@ export interface CronJob {
   state: JobState;
   execution: ExecutionMode;
   overlap?: OverlapPolicy;
+  afterRun?: AfterRun;
   createdAt: string;
   updatedAt: string;
   expiresAt: string;

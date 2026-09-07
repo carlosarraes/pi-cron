@@ -980,3 +980,55 @@ describe("registerCronTools", () => {
     ).rejects.toThrow("unavailable");
   });
 });
+
+it("exposes and forwards afterRun on create and update tools", async () => {
+  const { tools, service, savedService, ctx } = setup();
+  expect(
+    Value.Check(CronCreateParams, {
+      prompt: "check",
+      every: "5m",
+      afterRun: "clear",
+    }),
+  ).toBe(true);
+  expect(
+    Value.Check(CronUpdateParams, { selector: "Report", afterRun: "reset" }),
+  ).toBe(false);
+  await execute(
+    tools.get("cron_create"),
+    { prompt: "check", every: "5m", afterRun: "compact" },
+    ctx,
+  );
+  expect(service.create).toHaveBeenCalledWith(
+    expect.objectContaining({ afterRun: "compact" }),
+    expect.anything(),
+  );
+  await execute(
+    tools.get("cron_update"),
+    { selector: "Report", afterRun: "clear" },
+    ctx,
+  );
+  expect(service.replace).toHaveBeenCalledWith(
+    "job-1",
+    expect.objectContaining({ afterRun: "clear" }),
+    expect.anything(),
+  );
+  await execute(
+    tools.get("cron_saved_create"),
+    { prompt: "check", every: "5m", afterRun: "clear" },
+    ctx,
+  );
+  expect(savedService.create).toHaveBeenCalledWith(
+    expect.objectContaining({ afterRun: "clear" }),
+    expect.anything(),
+  );
+  await execute(
+    tools.get("cron_saved_update"),
+    { selector: "Report", afterRun: "none" },
+    ctx,
+  );
+  expect(savedService.replace).toHaveBeenCalledWith(
+    "save1234",
+    expect.objectContaining({ afterRun: "none" }),
+    expect.anything(),
+  );
+});

@@ -1111,7 +1111,7 @@ describe("extension factory", () => {
 
     piCron(pi);
 
-    expect(commands).toEqual(["cron"]);
+    expect(commands).toEqual(["cron", "cron-after-run"]);
     expect(tools).toEqual([
       "cron_create",
       "cron_list",
@@ -1258,4 +1258,723 @@ describe("saved cron runtime lifecycle", () => {
       configured.runtime.requireSavedService().list(),
     ).rejects.toThrow("trusted project required");
   });
+});
+
+describe("afterRun lifecycle", () => {
+  it("waits for full idle and compaction completion before the next dispatch", async () => {
+    const f = setup({
+      entries: [customEntry(event(job({ afterRun: "compact" })))],
+    });
+    let complete: (() => void) | undefined;
+    const compact = vi.fn((options) => {
+      complete = options.onComplete;
+    });
+    Object.assign(f.ctx, { compact, hasPendingMessages: () => false });
+    await f.start();
+    await settleAsync();
+    f.clock.advanceBy(60_000);
+    Object.assign(f.ctx, { isIdle: () => false });
+    await f.runtime.onAgentSettled(f.ctx);
+    expect(f.runtime.requireService().get("job-1")?.runCount).toBe(0);
+    Object.assign(f.ctx, { isIdle: () => true });
+    await f.runtime.onAgentSettled(f.ctx);
+    await settleAsync();
+    f.clock.advanceBy(0);
+    const command = f.sent.find((text) => text.startsWith("/cron-after-run "));
+    expect(command).toBeDefined();
+    const action = f.runtime.completeAfterRun(
+      command?.slice("/cron-after-run ".length) ?? "",
+      { ...f.ctx, waitForIdle: async () => {} } as never,
+    );
+    await settleAsync();
+    expect(compact).toHaveBeenCalledOnce();
+    expect(
+      f.sent.filter((text) => !text.startsWith("/cron-after-run")),
+    ).toHaveLength(1);
+    complete?.();
+    await action;
+    await settleAsync();
+    expect(
+      f.sent.filter((text) => !text.startsWith("/cron-after-run")),
+    ).toHaveLength(2);
+    await f.runtime.stop();
+  });
+
+  it.each([
+    "error",
+    "aborted",
+  ])("does not reset context on %s outcomes", async (stopReason) => {
+    const f = setup({
+      entries: [customEntry(event(job({ afterRun: "clear" })))],
+    });
+    await f.start();
+    await settleAsync();
+    f.entries.push({
+      type: "message",
+      message: { role: "assistant", stopReason, errorMessage: "failed" },
+    });
+    await f.runtime.onAgentSettled(f.ctx);
+    await settleAsync();
+    f.clock.advanceBy(0);
+    expect(f.sent).toHaveLength(1);
+    expect(f.runtime.requireService().get("job-1")?.lastTechnicalOutcome).toBe(
+      stopReason === "error" ? "failed" : "aborted",
+    );
+    await f.runtime.stop();
+  });
+});
+
+it("clear carries all jobs, counters and pending ticks into a replacement without conversation", async () => {
+  const f = setup({
+    reason: "reload",
+    entries: [
+      customEntry(event(job({ afterRun: "clear" }))),
+      customEntry(
+        event(
+          job({ id: "job-2", name: "Other", state: "paused", runCount: 7 }),
+        ),
+      ),
+      customEntry(
+        event(
+          job({
+            id: "job-3",
+            name: "Saved activation",
+            savedDefinitionId: "saved003",
+            runCount: 4,
+            schedule: { kind: "interval", intervalMs: 3600000, anchorAt: NOW },
+          }),
+        ),
+      ),
+      customEntry(
+        event(
+          job({
+            id: "job-4",
+            name: "Adaptive",
+            runCount: 2,
+            attributedTokens: 123,
+            schedule: {
+              kind: "adaptive",
+              nextWakeAt: "2026-07-15T10:30:00.000Z",
+              fallbackUsed: true,
+            },
+          }),
+        ),
+      ),
+      customEntry(
+        event(
+          job({
+            id: "job-5",
+            name: "One-shot",
+            prompt: { kind: "text", text: "pending one-shot" },
+            schedule: {
+              kind: "once",
+              at: "2026-07-15T10:00:30.000Z",
+              original: "30s",
+            },
+          }),
+        ),
+      ),
+    ],
+  });
+  await f.start();
+  await settleAsync();
+  f.clock.advanceBy(60_000);
+  await f.runtime.onAgentSettled(f.ctx);
+  await settleAsync();
+  f.clock.advanceBy(0);
+  const command = f.sent.find((text) => text.startsWith("/cron-after-run "));
+  expect(command).toBeDefined();
+  const replacement = setup({ sessionId: "replacement", reason: "new" });
+  const newSession = vi.fn(async (options) => {
+    await f.runtime.stop();
+    await options.setup({
+      getSessionId: () => "replacement",
+      appendCustomEntry: (customType: string, data: unknown) =>
+        replacement.entries.push({ type: "custom", customType, data }),
+    });
+    await replacement.start();
+    await settleAsync();
+    expect(replacement.sent).toHaveLength(0);
+    await options.withSession({
+      sendUserMessage: async (text: string) => {
+        await replacement.runtime.completeAfterRun(
+          text.slice("/cron-after-run ".length),
+          replacement.ctx as never,
+        );
+      },
+    });
+    return { cancelled: false };
+  });
+  await f.runtime.completeAfterRun(
+    command?.slice("/cron-after-run ".length) ?? "",
+    { ...f.ctx, waitForIdle: async () => {}, newSession } as never,
+  );
+  expect(newSession).toHaveBeenCalledOnce();
+  expect(replacement.entries).toEqual(
+    expect.arrayContaining([expect.objectContaining({ type: "custom" })]),
+  );
+  expect(
+    replacement.entries.some(
+      (entry) => (entry as { type: string }).type === "message",
+    ),
+  ).toBe(false);
+  expect(replacement.runtime.requireService().get("job-1")).toMatchObject({
+    runCount: 1,
+    lastOccurrenceAt: NOW,
+    afterRun: "clear",
+  });
+  expect(replacement.runtime.requireService().get("job-2")).toMatchObject({
+    state: "paused",
+    runCount: 7,
+  });
+  expect(replacement.runtime.requireService().get("job-3")).toMatchObject({
+    state: "active",
+    runCount: 4,
+    savedDefinitionId: "saved003",
+    schedule: { anchorAt: NOW },
+  });
+  expect(replacement.runtime.requireService().get("job-4")).toMatchObject({
+    state: "active",
+    runCount: 2,
+    attributedTokens: 123,
+    schedule: { nextWakeAt: "2026-07-15T10:30:00.000Z", fallbackUsed: true },
+  });
+  expect(replacement.runtime.requireService().get("job-5")?.state).toBe(
+    "active",
+  );
+  await settleAsync();
+  expect(replacement.sent).toEqual(["pending one-shot"]);
+  await replacement.runtime.stop();
+});
+
+it.each([
+  "cancel",
+  "throw",
+])("releases scheduling after clear %s without dropping jobs", async (failure) => {
+  const f = setup({
+    entries: [customEntry(event(job({ afterRun: "clear" })))],
+  });
+  await f.start();
+  await settleAsync();
+  f.clock.advanceBy(60_000);
+  await f.runtime.onAgentSettled(f.ctx);
+  await settleAsync();
+  f.clock.advanceBy(0);
+  const token =
+    f.sent
+      .find((text) => text.startsWith("/cron-after-run "))
+      ?.slice("/cron-after-run ".length) ?? "";
+  const newSession = vi.fn(async () => {
+    if (failure === "throw") throw new Error("switch failed");
+    return { cancelled: true };
+  });
+  const ctx = { ...f.ctx, waitForIdle: async () => {}, newSession };
+  await f.runtime.completeAfterRun(token, ctx as never);
+  await settleAsync();
+  expect(newSession).toHaveBeenCalledOnce();
+  expect(f.runtime.requireService().get("job-1")?.runCount).toBe(1);
+  expect(
+    f.sent.filter((text) => !text.startsWith("/cron-after-run")),
+  ).toHaveLength(2);
+  await f.runtime.completeAfterRun(token, ctx as never);
+  expect(newSession).toHaveBeenCalledOnce();
+  expect(() => f.runtime.assertWritable()).not.toThrow();
+  await expect(
+    f.runtime.requireService().pause("job-1"),
+  ).resolves.toMatchObject({ state: "paused" });
+  await f.runtime.stop();
+});
+
+it("ignores duplicate compaction requests and late callbacks after session switch", async () => {
+  const f = setup({
+    entries: [customEntry(event(job({ afterRun: "compact" })))],
+  });
+  let complete: (() => void) | undefined;
+  const compact = vi.fn((options) => {
+    complete = options.onComplete;
+  });
+  Object.assign(f.ctx, { compact });
+  await f.start();
+  await settleAsync();
+  await f.runtime.onAgentSettled(f.ctx);
+  await settleAsync();
+  f.clock.advanceBy(0);
+  const token =
+    f.sent
+      .find((text) => text.startsWith("/cron-after-run "))
+      ?.slice("/cron-after-run ".length) ?? "";
+  const ctx = { ...f.ctx, waitForIdle: async () => {} };
+  const action = f.runtime.completeAfterRun(token, ctx as never);
+  await settleAsync();
+  await f.runtime.completeAfterRun(token, ctx as never);
+  expect(compact).toHaveBeenCalledOnce();
+  await f.runtime.stop();
+  await action;
+  complete?.();
+  await f.runtime.completeAfterRun(token, ctx as never);
+  expect(compact).toHaveBeenCalledOnce();
+  expect(f.clock.pendingTimerCount()).toBe(0);
+});
+
+it("continues after compaction failure", async () => {
+  const f = setup({
+    entries: [customEntry(event(job({ afterRun: "compact" })))],
+  });
+  Object.assign(f.ctx, {
+    compact: (options: { onError: (error: Error) => void }) =>
+      options.onError(new Error("summary failed")),
+  });
+  await f.start();
+  await settleAsync();
+  f.clock.advanceBy(60_000);
+  await f.runtime.onAgentSettled(f.ctx);
+  await settleAsync();
+  f.clock.advanceBy(0);
+  const token =
+    f.sent
+      .find((text) => text.startsWith("/cron-after-run "))
+      ?.slice("/cron-after-run ".length) ?? "";
+  await f.runtime.completeAfterRun(token, {
+    ...f.ctx,
+    waitForIdle: async () => {},
+  } as never);
+  await settleAsync();
+  expect(f.notifications).toContain("pi-cron: summary failed");
+  expect(
+    f.sent.filter((text) => !text.startsWith("/cron-after-run")),
+  ).toHaveLength(2);
+  await f.runtime.stop();
+});
+
+it("does not act after losing the scheduler lease while its command waits for idle", async () => {
+  const f = setup({
+    entries: [customEntry(event(job({ afterRun: "compact" })))],
+    lease: new FakeLease({ heartbeat: [new Error("lost")] }),
+  });
+  await f.start();
+  await settleAsync();
+  await f.runtime.onAgentSettled(f.ctx);
+  await settleAsync();
+  f.clock.advanceBy(0);
+  const token =
+    f.sent
+      .find((text) => text.startsWith("/cron-after-run "))
+      ?.slice("/cron-after-run ".length) ?? "";
+  let release!: () => void;
+  const compact = vi.fn((options) => options.onComplete());
+  const action = f.runtime.completeAfterRun(token, {
+    ...f.ctx,
+    compact,
+    waitForIdle: () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+  } as never);
+  await settleAsync();
+  await f.fireHeartbeat();
+  release();
+  await action;
+  expect(compact).not.toHaveBeenCalled();
+  await f.runtime.stop();
+});
+
+it.each([
+  "delete",
+  "change",
+])("skips an obsolete action after job %s during execution", async (operation) => {
+  const f = setup({
+    entries: [customEntry(event(job({ afterRun: "clear" })))],
+  });
+  await f.start();
+  await settleAsync();
+  const service = f.runtime.requireService();
+  if (operation === "delete") await service.delete("job-1");
+  else await service.replace("job-1", { afterRun: "none" });
+  await f.runtime.onAgentSettled(f.ctx);
+  await settleAsync();
+  f.clock.advanceBy(0);
+  expect(f.sent).toHaveLength(1);
+  await f.runtime.stop();
+});
+
+it("still clears after a successful final run reaches its maxRuns", async () => {
+  const f = setup({
+    entries: [customEntry(event(job({ afterRun: "clear", maxRuns: 1 })))],
+  });
+  await f.start();
+  await settleAsync();
+  await f.runtime.onAgentSettled(f.ctx);
+  await settleAsync();
+  f.clock.advanceBy(0);
+  expect(f.runtime.requireService().get("job-1")?.state).toBe("completed");
+  expect(f.sent.some((text) => text.startsWith("/cron-after-run "))).toBe(true);
+  await f.runtime.stop();
+});
+
+it("does not clear if the action is disabled while waiting for the command", async () => {
+  const f = setup({
+    entries: [customEntry(event(job({ afterRun: "clear" })))],
+  });
+  await f.start();
+  await settleAsync();
+  await f.runtime.onAgentSettled(f.ctx);
+  await settleAsync();
+  f.clock.advanceBy(0);
+  const token =
+    f.sent
+      .find((text) => text.startsWith("/cron-after-run "))
+      ?.slice("/cron-after-run ".length) ?? "";
+  await f.runtime.requireService().replace("job-1", { afterRun: "none" });
+  const newSession = vi.fn(async () => ({ cancelled: true }));
+  await f.runtime.completeAfterRun(token, {
+    ...f.ctx,
+    waitForIdle: async () => {},
+    newSession,
+  } as never);
+  expect(newSession).not.toHaveBeenCalled();
+  await f.runtime.stop();
+});
+
+it("does not queue an old run's action after a new runtime generation starts", async () => {
+  const f = setup({
+    entries: [customEntry(event(job({ afterRun: "clear" })))],
+  });
+  await f.start();
+  await settleAsync();
+  let release!: () => void;
+  const service = f.runtime.requireService();
+  const record = service.recordRun.bind(service);
+  vi.spyOn(service, "recordRun").mockImplementation(async (...args) => {
+    await record(...args);
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  });
+  await f.runtime.onAgentSettled(f.ctx);
+  await settleAsync();
+  const stopped = f.runtime.stop();
+  release();
+  await stopped;
+  f.clock.advanceBy(0);
+  expect(f.sent).toHaveLength(1);
+  expect(f.clock.pendingTimerCount()).toBe(0);
+});
+
+it("preserves transferred pending one-shots if the replacement must recover its lease", async () => {
+  const f = setup({
+    reason: "new",
+    lease: new FakeLease({ acquire: [OTHER_OWNER, { owned: true }] }),
+    entries: [
+      customEntry(
+        event(
+          job({
+            schedule: {
+              kind: "once",
+              at: "2026-07-15T09:59:30.000Z",
+              original: "30s",
+            },
+          }),
+        ),
+      ),
+      {
+        type: "custom",
+        customType: "pi-cron/handoff",
+        data: {
+          version: 1,
+          sessionId: "session-1",
+          token: "transfer",
+          scheduler: {
+            pending: [["job-1", "2026-07-15T09:59:30.000Z"]],
+            occurrences: [],
+            initialQueued: [],
+          },
+        },
+      },
+    ],
+  });
+  await f.start();
+  await f.runtime.completeAfterRun("resume transfer", f.ctx as never);
+  f.clock.advanceBy(5000);
+  await f.flushLifecycle();
+  await settleAsync();
+  expect(f.runtime.requireService().get("job-1")).toMatchObject({
+    state: "completed",
+    runCount: 1,
+  });
+  expect(f.sent).toEqual(["Run report"]);
+  await f.runtime.stop();
+});
+
+it.each([
+  ["error", "none"],
+  ["aborted", "none"],
+  ["error", "compact"],
+  ["aborted", "compact"],
+  ["error", "clear"],
+  ["aborted", "clear"],
+] as const)("keeps adaptive fallback scheduling after %s with afterRun %s", async (stopReason, afterRun) => {
+  const f = setup({
+    entries: [
+      customEntry(
+        event(
+          job({
+            afterRun,
+            schedule: {
+              kind: "adaptive",
+              nextWakeAt: NOW,
+              fallbackUsed: false,
+            },
+          }),
+        ),
+      ),
+    ],
+  });
+  try {
+    await f.start();
+    await settleAsync();
+    f.entries.push({
+      type: "message",
+      message: { role: "assistant", stopReason },
+    });
+    await f.runtime.onAgentSettled(f.ctx);
+    await settleAsync();
+    expect(f.runtime.requireService().get("job-1")).toMatchObject({
+      state: "active",
+      runCount: 1,
+      lastTechnicalOutcome: stopReason === "error" ? "failed" : "aborted",
+      schedule: { nextWakeAt: "2026-07-15T10:20:00.000Z", fallbackUsed: true },
+    });
+    f.clock.advanceBy(0);
+    expect(f.sent).toEqual(["Run report"]);
+    f.clock.advanceBy(20 * 60_000);
+    await settleAsync();
+    expect(f.sent).toEqual(["Run report", "Run report"]);
+    await f.runtime.onAgentSettled(f.ctx);
+    await settleAsync();
+    expect(f.runtime.requireService().get("job-1")).toMatchObject({
+      state: "paused",
+      runCount: 2,
+      lastTechnicalOutcome: stopReason === "error" ? "failed" : "aborted",
+    });
+    f.clock.advanceBy(0);
+    expect(f.sent).toHaveLength(2);
+  } finally {
+    await f.runtime.stop();
+  }
+});
+
+it("captures mutations and queued ticks accepted during session_before_switch", async () => {
+  const f = setup({
+    entries: [
+      customEntry(event(job({ afterRun: "clear", maxRuns: 1 }))),
+      customEntry(event(job({ id: "job-2", name: "Other", runCount: 2 }))),
+      customEntry(
+        event(job({ id: "job-3", name: "Delete me", state: "paused" })),
+      ),
+    ],
+  });
+  await f.start();
+  await settleAsync();
+  await f.runtime.onAgentSettled(f.ctx);
+  await settleAsync();
+  f.clock.advanceBy(0);
+  const token =
+    f.sent
+      .find((text) => text.startsWith("/cron-after-run "))
+      ?.slice("/cron-after-run ".length) ?? "";
+  const replacement = setup({ sessionId: "replacement", reason: "new" });
+  const newSession = vi.fn(async (options) => {
+    await f.runtime
+      .requireService()
+      .pause("job-2", "Changed during before-switch");
+    await f.runtime.requireService().delete("job-3");
+    const added = await f.runtime.requireService().create({
+      name: "Added during before-switch",
+      prompt: { kind: "text", text: "new work" },
+      schedule: {
+        kind: "once",
+        at: "2026-07-15T11:00:00.000Z",
+        original: "1h",
+      },
+    });
+    const scheduler = f.runtime.getScheduler();
+    await scheduler?.runNow(added.id);
+    const service = f.runtime.requireService();
+    let approve!: (value: boolean) => void;
+    Object.assign(f.ctx.ui, {
+      confirm: () =>
+        new Promise<boolean>((resolve) => {
+          approve = resolve;
+        }),
+    });
+    const updating = service.replace("job-2", {
+      prompt: { kind: "text", text: "Accepted before shutdown" },
+    });
+    await settleAsync();
+    const shuttingDown = f.runtime.stop();
+    await settleAsync();
+    await expect(service.delete(added.id)).rejects.toThrow(/handoff/);
+    await expect(scheduler?.runNow(added.id)).rejects.toThrow(/handoff/);
+    expect(() => f.runtime.assertWritable()).toThrow(/read-only/);
+    approve(true);
+    await Promise.all([updating, shuttingDown]);
+    await options.setup({
+      getSessionId: () => "replacement",
+      appendCustomEntry: (customType: string, data: unknown) =>
+        replacement.entries.push({ type: "custom", customType, data }),
+    });
+    await replacement.start();
+    await options.withSession({
+      sendUserMessage: async (text: string) =>
+        replacement.runtime.completeAfterRun(
+          text.slice("/cron-after-run ".length),
+          replacement.ctx as never,
+        ),
+    });
+    return { cancelled: false };
+  });
+  try {
+    await f.runtime.completeAfterRun(token, {
+      ...f.ctx,
+      waitForIdle: async () => {},
+      newSession,
+    } as never);
+    await settleAsync();
+    expect(replacement.runtime.requireService().get("job-2")).toMatchObject({
+      state: "paused",
+      prompt: { text: "Accepted before shutdown" },
+    });
+    expect(replacement.runtime.requireService().get("job-3")).toBeUndefined();
+    expect(
+      replacement.runtime
+        .requireService()
+        .list()
+        .some((job) => job.name === "Added during before-switch"),
+    ).toBe(true);
+    expect(replacement.sent).toEqual(["new work"]);
+  } finally {
+    await f.runtime.stop();
+    await replacement.runtime.stop();
+  }
+});
+
+it("reports newSession failures after the old runtime has shut down", async () => {
+  const f = setup({
+    entries: [customEntry(event(job({ afterRun: "clear" })))],
+  });
+  await f.start();
+  await settleAsync();
+  await f.runtime.onAgentSettled(f.ctx);
+  await settleAsync();
+  f.clock.advanceBy(0);
+  const token =
+    f.sent
+      .find((text) => text.startsWith("/cron-after-run "))
+      ?.slice("/cron-after-run ".length) ?? "";
+  const newSession = async () => {
+    await f.runtime.stop();
+    throw new Error("replacement rebind failed");
+  };
+  await expect(
+    f.runtime.completeAfterRun(token, {
+      ...f.ctx,
+      waitForIdle: async () => {},
+      newSession,
+    } as never),
+  ).rejects.toThrow("replacement rebind failed");
+});
+
+it("reconciles a schedule edit approved during handoff before restoring future ticks", async () => {
+  const f = setup({
+    entries: [
+      customEntry(event(job({ afterRun: "clear", maxRuns: 1 }))),
+      customEntry(
+        event(
+          job({
+            id: "job-2",
+            name: "Deferred one-shot",
+            prompt: { kind: "text", text: "edited work" },
+            schedule: {
+              kind: "once",
+              at: "2026-07-15T10:01:00.000Z",
+              original: "1m",
+            },
+          }),
+        ),
+      ),
+    ],
+  });
+  const replacement = setup({ sessionId: "replacement", reason: "new" });
+  try {
+    await f.start();
+    await settleAsync();
+    await f.runtime.onAgentSettled(f.ctx);
+    await settleAsync();
+    f.clock.advanceBy(0);
+    const token =
+      f.sent
+        .find((text) => text.startsWith("/cron-after-run "))
+        ?.slice("/cron-after-run ".length) ?? "";
+    const newSession = async (
+      options: NonNullable<
+        Parameters<
+          import("@earendil-works/pi-coding-agent").ExtensionCommandContext["newSession"]
+        >[0]
+      >,
+    ) => {
+      let approve!: (value: boolean) => void;
+      Object.assign(f.ctx.ui, {
+        confirm: () =>
+          new Promise<boolean>((resolve) => {
+            approve = resolve;
+          }),
+      });
+      const updating = f.runtime.requireService().replace("job-2", {
+        schedule: {
+          kind: "once",
+          at: "2026-07-15T11:00:00.000Z",
+          original: "1h",
+        },
+      });
+      await settleAsync();
+      const stopping = f.runtime.stop();
+      await settleAsync();
+      approve(true);
+      await Promise.all([updating, stopping]);
+      expect(
+        f.sent.filter((text) => !text.startsWith("/cron-after-run")),
+      ).toEqual(["Run report"]);
+      await options.setup?.({
+        getSessionId: () => "replacement",
+        appendCustomEntry: (customType: string, data: unknown) =>
+          replacement.entries.push({ type: "custom", customType, data }),
+      } as never);
+      replacement.clock.advanceBy(2 * 60_000);
+      await replacement.start();
+      await options.withSession?.({
+        sendUserMessage: async (text: string) =>
+          replacement.runtime.completeAfterRun(
+            text.slice("/cron-after-run ".length),
+            replacement.ctx as never,
+          ),
+      } as never);
+      return { cancelled: false };
+    };
+    await f.runtime.completeAfterRun(token, {
+      ...f.ctx,
+      waitForIdle: async () => {},
+      newSession,
+    } as never);
+    await settleAsync();
+    expect(replacement.sent).toEqual([]);
+    expect(
+      replacement.runtime.getScheduler()?.nextDue()?.at.toISOString(),
+    ).toBe("2026-07-15T11:00:00.000Z");
+    replacement.clock.advanceBy(58 * 60_000);
+    await settleAsync();
+    expect(replacement.sent).toEqual(["edited work"]);
+  } finally {
+    await f.runtime.stop();
+    await replacement.runtime.stop();
+  }
 });
